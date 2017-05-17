@@ -26,6 +26,7 @@
 #endif
 
 #include <IOKit/IOTypes.h>
+#include <MacTypes.h>
 #include <device/device_types.h>
 
 #include <mach/mach.h>

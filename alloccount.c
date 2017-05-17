@@ -28,6 +28,7 @@ cc alloccount.c -o alloccount -Wall -framework IOKit
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <IOKit/IOKitKeys.h>
+#include <MacTypes.h>
 
 static void printNumber( CFDictionaryRef dict, CFStringRef name )
 {
