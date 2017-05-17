@@ -4,6 +4,7 @@ add_definitions(-DIOKIT -D_DARWIN_NO_64_BIT_INODE=1)
 
 include_directories(
 	${CMAKE_CURRENT_SOURCE_DIR}
+	${CMAKE_CURRENT_SOURCE_DIR}/include
 	${CMAKE_CURRENT_BINARY_DIR}
 	${CMAKE_SOURCE_DIR}/kernel-include/iokit
 	${CMAKE_SOURCE_DIR}/src/external/syslog/libsystem_asl.tproj/include
