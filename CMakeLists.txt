@@ -42,7 +42,7 @@ add_framework(IOKit CURRENT_VERSION FAT
 		${iokit_sources}
 	DEPENDENCIES
 		system
-		CoreFoundation
+		${CoreFoundation}
 )
 
 add_custom_target(IOKit_migs
