@@ -13,7 +13,7 @@ include_directories(
 	${CMAKE_SOURCE_DIR}/src
 )
 
-set(MIG_ARCH "x86-64")
+set(MIG_ARCH "x86_64")
 set(MIG_USER_SOURCE_SUFFIX "64.c")
 set(MIG_USER_HEADER_SUFFIX "64.h")
 mig(iokitmig.defs)
