@@ -5,12 +5,16 @@ add_definitions(-DIOKIT -D_DARWIN_NO_64_BIT_INODE=1)
 include_directories(
 	${CMAKE_CURRENT_SOURCE_DIR}
 	${CMAKE_CURRENT_SOURCE_DIR}/include
+	${CMAKE_CURRENT_SOURCE_DIR}/internal-include
 	${CMAKE_CURRENT_BINARY_DIR}
 	${CMAKE_SOURCE_DIR}/kernel-include/iokit
 	${CMAKE_SOURCE_DIR}/src/external/syslog/libsystem_asl.tproj/include
 	${CMAKE_SOURCE_DIR}/src/external/libdispatch/include
 	${CMAKE_SOURCE_DIR}/src/lkm/osfmk
-	${CMAKE_SOURCE_DIR}/src
+)
+
+add_compile_options(
+	-iquote ${CMAKE_CURRENT_BINARY_DIR}/pwr_mgt.subproj
 )
 
 set(MIG_ARCH "x86_64")
@@ -23,6 +27,11 @@ set(MIG_USER_SOURCE_SUFFIX "32.c")
 set(MIG_USER_HEADER_SUFFIX "32.h")
 mig(iokitmig.defs)
 
+unset(MIG_ARCH)
+unset(MIG_USER_SOURCE_SUFFIX)
+unset(MIG_USER_HEADER_SUFFIX)
+mig(pwr_mgt.subproj/powermanagement.defs)
+
 set(iokit_sources
 	IOBundle.c
 	IOCFPlugIn.c
@@ -33,7 +42,10 @@ set(iokit_sources
 	IOKitLib.c
 	iokitmig.c
 	IOMIGMachPort.c
-	#IOSystemConfiguration.c # doesn't build yet
+	IOSystemConfiguration.c
+	pwr_mgt.subproj/IOPMLib.c
+	pwr_mgt.subproj/IOPMLibPrivate.c
+	${CMAKE_CURRENT_BINARY_DIR}/pwr_mgt.subproj/powermanagementUser.c
 )
 
 add_framework(IOKit CURRENT_VERSION FAT
