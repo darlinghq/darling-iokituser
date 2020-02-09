@@ -21,16 +21,19 @@ add_compile_options(
 set(MIG_ARCH "x86_64")
 set(MIG_USER_SOURCE_SUFFIX "64.c")
 set(MIG_USER_HEADER_SUFFIX "64.h")
+set(MIG_XTRACE_SUFFIX "XtraceMig64.c")
 mig(iokitmig.defs)
 
 set(MIG_ARCH "i386")
 set(MIG_USER_SOURCE_SUFFIX "32.c")
 set(MIG_USER_HEADER_SUFFIX "32.h")
+set(MIG_XTRACE_SUFFIX "XtraceMig32.c")
 mig(iokitmig.defs)
 
 unset(MIG_ARCH)
 unset(MIG_USER_SOURCE_SUFFIX)
 unset(MIG_USER_HEADER_SUFFIX)
+unset(MIG_XTRACE_SUFFIX)
 mig(pwr_mgt.subproj/powermanagement.defs)
 
 set(iokit_sources
