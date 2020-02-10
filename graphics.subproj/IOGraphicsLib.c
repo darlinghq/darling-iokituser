@@ -2477,7 +2477,7 @@ IOFBRebuild( IOFBConnectRef connectRef, Boolean forConnectChange )
 	    snprintf(sbuf, sizeof(sbuf), "0x%x,0x%x(%dx%d)", 
 			    (int)connectRef->displayVendor, (int)connectRef->displayProduct,
 			    (int)connectRef->defaultWidth, (int)connectRef->defaultHeight);
-
+#ifndef DARLING
 	    asl_set(msg, kMsgTracerKeyDomain,    "com.apple.iokit.graphics.displaytype" );
 	    asl_set(msg, kMsgTracerKeySignature, sbuf);
 
@@ -2497,6 +2497,7 @@ IOFBRebuild( IOFBConnectRef connectRef, Boolean forConnectChange )
 	    	IOObjectRelease(regEntry);
 	    }
 	    asl_set(msg, kMsgTracerKeyResult,	 "noop");
+#endif
 	    asl_log(NULL, msg, ASL_LEVEL_NOTICE, "displayonline");
 	    asl_free(msg);
 	}
@@ -5399,11 +5400,11 @@ IOFBSetupFIFOBurst( void * blitterRef, UInt32 x, UInt32 y, UInt32 w, UInt32 h, U
 
 void
 IOFBBurstWrite32( void * p1, void * p2, void * p3, void * p4, void * p5, void * p6, void * p7, void * p8 )
-{ return kIOReturnUnsupported; }
+{ /*return kIOReturnUnsupported;*/ }
 
 void
 IOFBSetBurstRef( void * burstRef )
-{ return kIOReturnUnsupported; }
+{ /*return kIOReturnUnsupported;*/ }
 
 kern_return_t
 IOFBCommitMemory( void * blitterRef, vm_address_t start, vm_size_t length, IOOptionBits options, void ** memoryRef, IOByteCount * offset )
@@ -5417,6 +5418,7 @@ IOFBReleaseMemory( void * blitterRef, void * memoryRef )
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
+#ifndef DARLING
 #include <IOKit/i2c/IOI2CInterfacePrivate.h>
 
 struct IOI2CConnect
@@ -5577,3 +5579,4 @@ IOReturn IOI2CSendRequest( IOI2CConnectRef connect, IOOptionBits options __unuse
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
+#endif
