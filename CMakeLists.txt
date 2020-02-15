@@ -60,6 +60,16 @@ set(iokit_sources
 	graphics.subproj/IOGraphicsLib.c
 	graphics.subproj/PEFSupport.c
 	platform.subproj/IOPlatformSupport.c
+	pwr_mgt.subproj/IOPMAssertions.c
+	pwr_mgt.subproj/IOPMAutoWake.c
+	pwr_mgt.subproj/IOPMEnergyPrefs.c
+	pwr_mgt.subproj/IOPMLib.c
+	pwr_mgt.subproj/IOPMLibPrivate.c
+	#pwr_mgt.subproj/IOPMPowerNotifications.c
+	pwr_mgt.subproj/IOPMRepeatingPower.c
+	pwr_mgt.subproj/IOPMUPSPrefs.c
+	ps.subproj/IOPowerSources.c
+	ps.subproj/IOPowerSourcesPrivate.c
 	${CMAKE_CURRENT_BINARY_DIR}/pwr_mgt.subproj/powermanagementUser.c
 )
 

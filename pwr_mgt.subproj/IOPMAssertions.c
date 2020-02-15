@@ -31,6 +31,11 @@
 #include <notify.h>
 #include <execinfo.h>
 #include <asl.h>
+
+#ifdef DARLING
+#   define TARGET_OS_SIMULATOR 1 // to disable energy tracing
+#endif
+
 #if !TARGET_OS_SIMULATOR
 #include <energytrace.h>
 #endif

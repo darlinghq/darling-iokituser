@@ -909,6 +909,7 @@ CFRunLoopSourceRef IOPMPrefsNotificationCreateRunLoopSource(
     IOPMPrefsCallbackType callback, 
     void *context) 
 {
+#ifndef DARLING
     SCDynamicStoreRef           store = NULL;
     CFStringRef                 EnergyPrefsKey = NULL;
     CFRunLoopSourceRef          SCDrls = NULL;
@@ -943,6 +944,10 @@ CFRunLoopSourceRef IOPMPrefsNotificationCreateRunLoopSource(
     CFRelease(store);
 
     return SCDrls;
+#else
+    puts("STUB: IOPMPrefsNotificationCreateRunLoopSource");
+    return NULL;
+#endif
 }
 
 /******************************************************************************/
@@ -1429,7 +1434,7 @@ static void IOPMRemoveIrrelevantProperties(CFMutableDictionaryRef energyPrefs)
             {
                 if( CFEqual((CFStringRef)dict_keys[dict_count], CFSTR(kIOPMDarkWakeBackgroundTaskKey)) ) 
                 {
-#if !TARGET_OS_IPHONE
+#if !TARGET_OS_IPHONE && !defined(DARLING)
                     // We conditionalize PowerNap support on kIOPMPowerNapSupportedKey for all
                     // machines late 2012 and beyond. The presence of this key is a sufficient
                     // condition to support PowerNap
