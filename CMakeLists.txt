@@ -11,7 +11,7 @@ include_directories(
 	${CMAKE_SOURCE_DIR}/kernel-include/iokit
 	${CMAKE_SOURCE_DIR}/src/external/syslog/libsystem_asl.tproj/include
 	${CMAKE_SOURCE_DIR}/src/external/libdispatch/include
-	${CMAKE_SOURCE_DIR}/src/lkm/osfmk
+	${CMAKE_SOURCE_DIR}/src/external/lkm/osfmk
 )
 
 add_compile_options(
