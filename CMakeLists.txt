@@ -5,13 +5,8 @@ add_definitions(-DIOKIT -D_DARWIN_NO_64_BIT_INODE=1 -DNO_CFPLUGIN=1 -DIOKIT_SERV
 include_directories(
 	${CMAKE_CURRENT_SOURCE_DIR}
 	${CMAKE_CURRENT_SOURCE_DIR}/include
-	${CMAKE_SOURCE_DIR}/src/external/ruby/include
 	${CMAKE_CURRENT_SOURCE_DIR}/internal-include
 	${CMAKE_CURRENT_BINARY_DIR}
-	${CMAKE_SOURCE_DIR}/kernel-include/iokit
-	${CMAKE_SOURCE_DIR}/src/external/syslog/libsystem_asl.tproj/include
-	${CMAKE_SOURCE_DIR}/src/external/libdispatch/include
-	${CMAKE_SOURCE_DIR}/src/external/lkm/osfmk
 )
 
 add_compile_options(
