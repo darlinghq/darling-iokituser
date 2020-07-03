@@ -49,10 +49,27 @@
 
 __BEGIN_DECLS
 
+CF_ASSUME_NONNULL_BEGIN
+CF_IMPLICIT_BRIDGING_ENABLED
+
+/*!
+ @enum      IOHIDTransactionOptions
+ @abstract  Various options that can be supplied to IOHIDTransaction functions.
+ @const     kIOHIDTransactionOptionsNone For those times when supplying 0 just isn't
+            explicit enough.
+ @const     kIOHIDTransactionOptionsWeakDevice specifies the transaction to not retain the
+            IOHIDDeviceRef being passed in. The expectation is that transaction will only exist during
+            the lifetime of the IOHIDDeviceRef object.
+ */
+typedef CF_OPTIONS(uint32_t, IOHIDTransactionOptions) {
+    kIOHIDTransactionOptionsNone = 0x0,
+    kIOHIDTransactionOptionsWeakDevice = 0x1,
+};
+
 /*! @typedef IOHIDTransactionRef
 	This is the type of a reference to the IOHIDTransaction.
 */
-typedef struct __IOHIDTransaction * IOHIDTransactionRef;
+typedef struct CF_BRIDGED_TYPE(id) __IOHIDTransaction * IOHIDTransactionRef;
 
 /*!
 	@function   IOHIDTransactionGetTypeID
@@ -75,8 +92,8 @@ AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
     @result     Returns a new IOHIDTransactionRef.
 */
 CF_EXPORT
-IOHIDTransactionRef IOHIDTransactionCreate(
-                                CFAllocatorRef                  allocator, 
+IOHIDTransactionRef _Nullable IOHIDTransactionCreate(
+                                CFAllocatorRef _Nullable        allocator,
                                 IOHIDDeviceRef                  device,
                                 IOHIDTransactionDirectionType   direction,
                                 IOOptionBits                    options)
@@ -233,7 +250,7 @@ AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
     @result     Returns IOHIDValueRef for the given element.
 */
 CF_EXPORT
-IOHIDValueRef IOHIDTransactionGetValue(
+IOHIDValueRef _Nullable IOHIDTransactionGetValue(
                                 IOHIDTransactionRef             transaction,
                                 IOHIDElementRef                 element,
                                 IOOptionBits                    options)
@@ -282,8 +299,8 @@ CF_EXPORT
 IOReturn IOHIDTransactionCommitWithCallback(
                                 IOHIDTransactionRef             transaction,
                                 CFTimeInterval                  timeout, 
-                                IOHIDCallback                   callback, 
-                                void *                          context)
+                                IOHIDCallback _Nullable         callback,
+                                void * _Nullable                context)
 AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
 
 /*! 
@@ -297,7 +314,11 @@ CF_EXPORT
 void IOHIDTransactionClear(
                                 IOHIDTransactionRef             transaction)
 AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
-                                
+
+
+CF_IMPLICIT_BRIDGING_DISABLED
+CF_ASSUME_NONNULL_END
+
 __END_DECLS
 
 #endif /* _IOKIT_HID_IOHIDTRANSACTION_USER_H */

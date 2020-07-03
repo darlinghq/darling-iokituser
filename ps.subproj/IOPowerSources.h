@@ -29,6 +29,7 @@
 #define _IOKIT_IOPOWERSOURCES_H
 
 #include <sys/cdefs.h>
+#include <CoreFoundation/CoreFoundation.h> /* CFTimeInterval, CFArrayRef, CFDictionaryRef, CFRunLoopSourceRef */
 __BEGIN_DECLS
 
 
@@ -75,10 +76,12 @@ typedef enum {
 
 /*! @constant   kIOPSLowBatteryWarningEarly
  *
- *  @abstract   The system is in an early low battery situation.
+ *  @abstract   The battery can provide no more than 20 minutes of runtime.
  *
- *  @discussion Per Apple's definition, the battery has dropped below 22% remaining power.
- *              OS X alerts the user by changing the color of BatteryMonitor to red. 
+ *  @discussion OS X makes no guarantees that the system shall remain in Early Warning for 20 minutes.
+ *              Batteries are frequently calibrated differently and may provide runtime
+ *              for more, or less, than the estimated 20 minutes.
+ *              OS X alerts the user by changing the color of BatteryMonitor to red.
  *              Warning the user is optional for full screen apps.
  */
     kIOPSLowBatteryWarningEarly = 2,
@@ -129,7 +132,7 @@ IOPSLowBatteryWarningLevel IOPSGetBatteryWarningLevel(void);
  * @abstract    C-string key for a notification of changes to the active power source.
  * @discussion  Use this notification to discover when the active power source changes from AC power (unlimited/wall power),
  *              to Battery Power or UPS Power (limited power). IOKit will not deliver this notification when a battery's
- *              time remaining changes, only when the active power source changes. This makes it a more effiicent
+ *              time remaining changes, only when the active power source changes. This makes it a more efficient
  *              choice for clients only interested in differentiating AC vs Battery.
  *
  *              See API <code>@link IOPSGetTimeRemainingEstimate @/link</code> to determine whether the active power source is
@@ -162,7 +165,7 @@ IOPSLowBatteryWarningLevel IOPSGetBatteryWarningLevel(void);
  * @define      kIOPSNotifyAnyPowerSource
  * @abstract    C-string key for a notification that of changes to any attribute of any IOPowerSource.
  * @discussion  Use notify(3) API to register for notifications.
- *              IOKit posts this notificatino more frequently than the other notifications, and thus uses more
+ *              IOKit posts this notification more frequently than the other notifications, and thus uses more
  *              energy to run your code. To conserve CPU cycles and battery life, please consider another notification 
  *              that also fits your needs. Please consider these instead:
  *                  <code>@link kIOPSNotifyPowerSource @/link</code>,

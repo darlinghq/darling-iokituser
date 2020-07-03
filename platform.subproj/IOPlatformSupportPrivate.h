@@ -1,3 +1,4 @@
+
 /*
  * Copyright (c) 2012 Apple Inc. All rights reserved.
  *
@@ -25,7 +26,9 @@
 #ifndef IOKitUser_IOPLATFORMSUPPORTPRIVATE_h
 #define IOKitUser_IOPLATFORMSUPPORTPRIVATE_h
 
-#if !TARGET_OS_EMBEDDED
+#include <TargetConditionals.h>
+
+#if TARGET_OS_OSX
 #include <IOKit/IOReturn.h>
 #include <CoreFoundation/CoreFoundation.h>
 
@@ -137,5 +140,17 @@ Boolean IOAuthenticatedRestartSupported(void);
 IOReturn IOPlatformGetDeviceColor(  CFStringRef whichColor,
                                     uint8_t * red, uint8_t * green, uint8_t * blue );
 
-#endif
-#endif
+/*!
+ * @function    IOCopyModel
+ * @abstract    Copy the model name, major and minor revision numbers
+ * @discussion  This function returns the model name of the sysem.
+ * @param       char ** model - Allocates and returns the model name.
+ * @param       uint32_t *majorRev - Major revision number
+ * @param       uint32_t *minorRev - Minor revision number
+ * @result      kIOReturnSuccess on success. Caller is expected to release memory for *model.
+ */
+IOReturn  IOCopyModel(char** model, uint32_t *majorRev, uint32_t *minorRev);
+
+
+#endif /* TARGET_OS_OSX */
+#endif /* IOKitUser_IOPLATFORMSUPPORTPRIVATE_h */

@@ -42,6 +42,11 @@
 #include "fat_util.h"
 #include "macho_util.h"
 
+/*
+ * Maximum number of arches we would ever expect to see in a fat binary.
+ */
+#define MAX_ARCHES 32
+
 /*******************************************************************************
 *
 *******************************************************************************/
@@ -91,11 +96,15 @@ static int __fat_iterator_init(
             sizeof(struct fat_header));
         iter->num_arches = OSSwapBigToHostInt32(
             iter->fat_header->nfat_arch);
+
+        if (iter->num_arches > MAX_ARCHES) {
+            goto finish;
+        }
+
         arches_end = (void *)iter->fat_arches +
             (iter->num_arches * sizeof(struct fat_arch));
 
         if (arches_end > iter->file_end) {
-
             goto finish;
         }
 
@@ -320,6 +329,7 @@ int fat_iterator_find_fat_arch(
     struct fat_arch * fat_arches_copy = NULL;  // must free
 
     struct fat_arch * found_arch;
+    struct fat_arch fake_fat_arches;
 
     magic = MAGIC32(iter->file_start);
 
@@ -355,7 +365,6 @@ int fat_iterator_find_fat_arch(
                 OSSwapBigToHostInt32(fat_arches[index].align);
         }
     } else {
-        struct fat_arch fake_fat_arches;
         uint8_t  swap;
         struct mach_header * mach_hdr;
 

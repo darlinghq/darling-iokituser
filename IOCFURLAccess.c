@@ -155,7 +155,7 @@ static Boolean _IOFileURLCreateDataAndPropertiesFromResource(CFAllocatorRef allo
     return success;
 }
 
-Boolean IOURLWriteDataAndPropertiesToResource(CFURLRef url, CFDataRef data, CFDictionaryRef propertyDict, int32_t *errorCode) {
+Boolean IOURLWriteDataAndPropertiesToResource(CFURLRef url, CFDataRef data, CFDictionaryRef propertyDict, SInt32 *errorCode) {
     CFStringRef scheme = CFURLCopyScheme(url);
     if (!scheme) {
         if (errorCode) *errorCode = kIOURLImproperArgumentsError;

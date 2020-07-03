@@ -25,6 +25,7 @@
  * 
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
+#include <CommonCrypto/CommonDigest.h>
 #include <CoreFoundation/CFRuntime.h>
 #include <CoreFoundation/CFBundlePriv.h>
 #include <IOKit/IOKitLib.h>
@@ -34,13 +35,25 @@
 
 #ifndef IOKIT_EMBEDDED
 #include <kxld.h>
+#include <kxld_types.h>
 #endif
 
+#ifdef SPLIT_KEXTS_DEBUG
+#undef SPLIT_KEXTS_DEBUG
+#endif
+#define SPLIT_KEXTS_DEBUG 0
+
+#include <sys/cdefs.h>
 #include <System/libkern/mkext.h>
 #include <System/libkern/kext_request_keys.h>
-#include <System/libkern/prelink.h>
 #include <System/libkern/OSKextLibPrivate.h>
 #include <Kernel/mach/vm_param.h>
+#if __has_include(<prelink.h>)
+/* take prelink.h from host side tools SDK */
+#include <prelink.h>
+#else
+#include <System/libkern/prelink.h>
+#endif
 
 #include <fcntl.h>
 #include <libc.h>
@@ -50,8 +63,11 @@
 #include <zlib.h>
 #include <sys/file.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <uuid/uuid.h>
+#include <libgen.h>
+#include <sandbox/rootless.h>
 
 #include "OSKext.h"
 #include "OSKextPrivate.h"
@@ -60,8 +76,72 @@
 #include "macho_util.h"
 #include "misc_util.h"
 #include "cross_link.h"
+#include "kextsplit.h"
 
 #define SHARED_EXECUTABLE 1
+
+/* The absolute minimum alignment for a kext segment */
+#define KEXT_MIN_ALIGN    6 /* 1 << 6 (64) */
+
+#ifndef SEG_TEXT_EXEC
+#define SEG_TEXT_EXEC "__TEXT_EXEC"
+#endif
+
+#ifndef SEG_DATA_CONST
+#define SEG_DATA_CONST "__DATA_CONST"
+#endif
+
+#ifndef SEG_LLVM_COV
+#define SEG_LLVM_COV   "__LLVM_COV"
+#endif
+
+#ifndef kPrelinkTextSegment
+#define kPrelinkTextSegment                "__PRELINK_TEXT"
+#endif
+
+#ifndef kPrelinkTextExecSegment
+#define kPrelinkTextExecSegment            "__PLK_TEXT_EXEC"
+#endif
+
+#ifndef kPrelinkTextSection
+#define kPrelinkTextSection                "__text"
+#endif
+
+
+#ifndef kPrelinkDataSegment
+#define kPrelinkDataSegment                "__PRELINK_DATA"
+#endif
+
+#ifndef kPrelinkDataConstSegment
+#define kPrelinkDataConstSegment           "__PLK_DATA_CONST"
+#endif
+
+#ifndef kPrelinkDataSection
+#define kPrelinkDataSection                "__data"
+#endif
+
+#ifndef kPrelinkLinkeditSegment
+#define kPrelinkLinkeditSegment           "__PLK_LINKEDIT"
+#endif
+
+#ifndef kPrelinkLLVMCovSegment
+#define kPrelinkLLVMCovSegment            "__PLK_LLVM_COV"
+#endif
+
+#ifndef kPrelinkLLVMCovSection
+#define kPrelinkLLVMCovSection            "__llvm_covmap"
+#endif
+
+#ifndef kPrelinkLinkeditSection
+#define kPrelinkLinkeditSection           "__data"
+#endif
+
+#define MAX_SEGNAME_LEN                   16
+#define MAX_SUFFIX_LEN                    128
+
+#ifndef kOSKextVariantOverrideKey
+#define kOSKextVariantOverrideKey               "OSKextVariantOverride"
+#endif
 
 #pragma mark Notes
 /*********************************************************************
@@ -83,6 +163,24 @@ much if at all, so there shouldn't be
 * OSKext Data Structures
 *********************************************************************/
 
+#ifdef IOKIT_EMBEDDED
+// ugly hack to get this to build.... (also defined in kxld_types.h)
+typedef struct splitKextLinkInfo {
+    u_char *        kextExecutable;     // kext we will link
+    size_t          kextSize;           // size of kextExecutable
+    u_char *        linkedKext;         // linked kext
+    size_t          linkedKextSize;     // size of linkedKext
+    uint64_t        vmaddr_TEXT;        // vmaddr of kext __TEXT segment
+    uint64_t        vmaddr_TEXT_EXEC;   // vmaddr of kext __TEXT_EXEC segment
+    uint64_t        vmaddr_DATA;        // vmaddr of kext __DATA segment
+    uint64_t        vmaddr_DATA_CONST;  // vmaddr of kext __DATA_CONST segment
+    uint64_t        vmaddr_LINKEDIT;    // vmaddr of kext __LINKEDIT segment
+    uint64_t        vmaddr_LLVM_COV;    // vmaddr of kext __LLVM_COV segment
+    uint32_t        kaslr_offsets_count; // offsets into the kext to slide
+    uint32_t *      kaslr_offsets;      // offsets into the kext to slide
+} splitKextLinkInfo;
+#endif
+
 typedef struct __OSKextLoadInfo {
    /* Used whenever a dependency graph is needed (generating an mkext,
     * prelinked kernel, or linking/loading).
@@ -94,20 +192,16 @@ typedef struct __OSKextLoadInfo {
     */
     CFDictionaryRef   kernelLoadInfo;   // for lazy eval, cleared when we check
     uint32_t          loadTag;
-    uint64_t          loadAddress;      // 64-bit for max coverage
-    uint64_t          sourceAddress;    // For prelinking: where it starts in memory
-    size_t            headerSize;       // xxx - needed?
-    size_t            loadSize;         // xxx - haxx; do we need wiredSize?
+    splitKextLinkInfo linkInfo;    // used for kcgen and kxld interactions
+    uint64_t          sourceAddress;    // For prelinking: where it starts in memory (x86_64)
 
    /* These only exist while loading from user space.
     */
-    CFURLRef          executableURL;
     CFDataRef         executable;
     CFDataRef         linkedExecutable;
     CFDataRef         prelinkedExecutable;
     kmod_info_t     * kmod_info;
     uint64_t          kmodInfoAddress;
-    uint64_t          linkStateAddress;
     
     struct {
         unsigned int  hasRawKernelDependency:1;
@@ -158,7 +252,7 @@ typedef struct __OSKext {
    /* Read/retained at creation time. */
     CFURLRef              bundleURL;
     CFStringRef           bundleID;
-
+    CFURLRef              executableURL;
 
    /* Read by __OSKextProcessInfoDictionary(). */
     OSKextVersion         version;
@@ -185,14 +279,18 @@ typedef struct __OSKext {
        /* Set by __OSKextProcessInfoDictionary() */
         unsigned int      isKernelComponent:1;
         unsigned int      isInterface:1;
-        unsigned int      declaresExecutable:1;
+        unsigned int      declaresKernelExecutable:1;
+        unsigned int      declaresUserExecutable:1;
         unsigned int      loggingEnabled:1;
         unsigned int      plistHasEnableLoggingSet:1;
         unsigned int      plistHasIOKitDebugFlags:1;
         unsigned int      isLoadableInSafeBoot:1;
 
        /* Set as determined or on demand. */
-        unsigned int      validated:1;  // all possible checks done
+        unsigned int      rootless_trusted:1; // protected by installer:
+                                           // don't flush authentication bits
+
+        unsigned int      validated:1;     // all possible checks done
         unsigned int      invalid:1;       // at least 1 failure, or fully validated
         unsigned int      valid:1;         // all possible checks done & passed
 
@@ -212,8 +310,20 @@ typedef struct __OSKext {
 * Internal Constants and Enums
 *********************************************************************/
 
-#define __sOSKextFullBundleExtension     ".kext/"
-#define __kDSStoreFilename               CFSTR(".DS_Store")
+/* IOKitUser_host target builds against last release's xnu... :/ */
+#ifndef kOSBundleRequiredDriverKit
+#define kOSBundleRequiredDriverKit "DriverKit"
+#endif
+
+#ifndef kCFBundleIdentifierKernelKey
+#define kCFBundleIdentifierKernelKey "CFBundleIdentifierKernel"
+#endif
+
+#define __sOSKextBundleExtension            ".kext/"
+#define __sOSKextDriverKitBundleExtension   ".dext/"
+#define __kOSKextBundlePackageTypeKext      CFSTR("KEXT")
+#define __kOSKextBundlePackageTypeDriverKit CFSTR("DEXT")
+#define __kDSStoreFilename                  CFSTR(".DS_Store")
 
 #define __kOSKextKernelIdentifier        CFSTR("__kernel__")
 #define __kOSKextUnknownIdentifier       "__unknown__"
@@ -224,6 +334,8 @@ typedef struct __OSKext {
 #define __kOSKextKPIPrefix               CFSTR("com.apple.kpi.")
 #define __kOSKextCompatibilityBundleID   "com.apple.kernel.6.0"
 #define __kOSKextPrivateKPI              CFSTR("com.apple.kpi.private")
+#define __kOSKextKasanKPI                CFSTR("com.apple.kpi.kasan")
+#define __kOSKextKasanKPIVersion         CFSTR("8.0.0b1")
 
 /* Used when generating symbols.
  */
@@ -250,16 +362,24 @@ typedef struct __OSKext {
 #define __kOSKextIdentifierCacheBasePathKey    "OSKextIdentifierCacheBasePath"
 #define __kOSKextIdentifierCacheKextInfoKey    "OSKextIdentifierCacheKextInfo"
 #define __kOSKextIdentifierCacheVersionKey     "OSKextIdentifierCacheVersion"
-#define __kOSKextIdentifierCacheCurrentVersion (1)
+#define __kOSKextIdentifierCacheCurrentVersion (2)
 
+#ifndef kKextRequestPredicateGetLoadedByUUID
+#define kKextRequestPredicateGetLoadedByUUID       "Get Loaded Kext Info By UUID"
+#endif
 
 #pragma mark Module Internal Variables
 /*********************************************************************
 * Module Internal Variables
 *********************************************************************/
 
+const char * OSKEXT_BUILD_DATE = "OSKEXT_BUILD_DATE " __TIME__ " " __DATE__;
+
 static pthread_once_t __sOSKextInitialized  = PTHREAD_ONCE_INIT;
 static Boolean        __sOSKextInitializing = false;
+
+/* force alignment to 4k boundaries */
+__unused static const int g_max_align_to_4k = 0;
 
 /* Internal lookup collections.
  * Created the first time any kext is; all functions that access should
@@ -267,9 +387,9 @@ static Boolean        __sOSKextInitializing = false;
  *
  * Values are NOT retained.
  */
-static CFMutableArrayRef      __sOSAllKexts                = NULL;
-static CFMutableDictionaryRef __sOSKextsByURL              = NULL;
-static CFMutableDictionaryRef __sOSKextsByIdentifier       = NULL;
+static CFMutableArrayRef      __sOSAllKexts                 = NULL;
+static CFMutableDictionaryRef __sOSKextsByURL               = NULL;
+static CFMutableDictionaryRef __sOSKextsByIdentifier        = NULL;
 
 /* The default log flags result in errors and the special explicit
  * messages going out, and that's about it.
@@ -286,10 +406,16 @@ static const NXArchInfo       __sOSKextUnknownArchInfo         = {
     .byteorder   = NX_UnknownByteOrder,
     .description = "unknown CPU architecture",
 };
-static const NXArchInfo     * __sOSKextArchInfo                     = &__sOSKextUnknownArchInfo;
-static Boolean                __sOSKextSimulatedSafeBoot           = FALSE;
-static Boolean                __sOSKextUsesCaches                  = TRUE;
-static Boolean                __sOSKextStrictRecordingByLastOpened = FALSE;
+static const NXArchInfo              * __sOSKextArchInfo                    = &__sOSKextUnknownArchInfo;
+static CFStringRef                     __sOSKextTargetString                = NULL;
+static Boolean                         __sOSKextSimulatedSafeBoot           = FALSE;
+static Boolean                         __sOSKextUsesCaches                  = TRUE;
+static Boolean                         __sOSKextStrictRecordingByLastOpened = FALSE;
+static Boolean                         __sOSKextStrictAuthentication        = FALSE;
+static OSKextAuthFnPtr                 __sOSKextAuthenticationFunction      = _OSKextBasicFilesystemAuthentication;
+static OSKextLoadAuditFnPtr            __sOSKextLoadAuditFunction           = NULL;
+static OSKextPersonalityPatcherFnPtr   __sOSKextPersonalityPatcherFunction  = NULL;
+static void                          * __sOSKextAuthenticationContext       = NULL;
 
 static CFArrayRef             __sOSKextPackageTypeValues       = NULL;
 static CFArrayRef             __sOSKextOSBundleRequiredValues  = NULL;
@@ -299,6 +425,20 @@ static OSKextDiagnosticsFlags __sOSKextRecordsDiagnositcs      = kOSKextDiagnost
 // xxx - need a lock for thread safety
 
 static OSKextVersion          __sOSNewKmodInfoKernelVersion = -1;
+
+char OSKextExecutableVariant[MAX_SUFFIX_LEN];
+
+__unused static uint64_t nSplitKexts = 0, nNonSplitKexts = 0;
+
+enum enumSegIdx {
+    SEG_IDX_TEXT,
+    SEG_IDX_TEXT_EXEC,
+    SEG_IDX_DATA,
+    SEG_IDX_DATA_CONST,
+    SEG_IDX_LLVM_COV,
+    SEG_IDX_LINKEDIT,
+    SEG_IDX_COUNT,
+};
 
 /* These are function protos but we need them ahead of their
  * references.
@@ -326,6 +466,7 @@ static const char * safe_mach_error_string(mach_error_t error_code);
 static CFArrayRef        __sOSKextSystemExtensionsFolderURLs = NULL;
 static CFArrayRef        __sOSKextInfoEssentialKeys          = NULL;
 // xxx - This set is all except OSBundleExecutablePath, OSBundleMachOHeaders, and OSBundleClasses.
+static CFArrayRef        __sOSKextInfoKextOnlyKeys           = NULL;
 
 const char * kOSKextLoadNotification   = "com.apple.kext.load";
 const char * kOSKextUnloadNotification = "com.apple.kext.unload";
@@ -383,6 +524,9 @@ const CFStringRef kOSKextDiagnosticSharedExecutableAndExecutableKey =
                   CFSTR("Kext declares both CFBundleExecutable and "
                   "CFBundleSharedExecutableIdentifier; use only one.");
 #endif /* SHARED_EXECUTABLE */
+const CFStringRef kOSKextDiagnosticUserExecutableAndExecutableKey =
+                  CFSTR("CFBundlePackageType is DEXT and bundle declares "
+                  "CFBundleExecutable; use only one.");
 const CFStringRef kOSKextDiagnosticCompatibleVersionLaterThanVersionKey =
                   CFSTR("Compatible version must be lower than current version.");
 const CFStringRef kOSKextDiagnosticExecutableBadKey =
@@ -457,7 +601,7 @@ const CFStringRef kOSKextDiagnosticBundleVersionMismatchKey =
 
 const CFStringRef kOSKextDiagnosticsDependencyNotOSBundleRequired =
                   CFSTR("Dependency lacks appropriate value for OSBundleRequired "
-                  "and may not be availalble during early boot");
+                  "and may not be available during early boot");
 
 const CFStringRef kOSKextDiagnosticNotSignedKey =
                   CFSTR("Kext is not signed");
@@ -509,11 +653,62 @@ const CFStringRef kOSKextDiagnosticIneligibleInSafeBoot =
                   CFSTR("Kext isn't loadable during safe boot.");
 const CFStringRef kOSKextDependencyIneligibleInSafeBoot =
                   CFSTR("Dependencies aren't loadable during safe boot");
+const CFStringRef kOSKextDiagnosticOSBundleRequiredValueIneligibleForDriverKit =
+                  CFSTR("Driver Extension lacks appropriate value for OSBundleRequired, "
+                        "and will not be launched without kextd present. Use one of "
+                        "'DriverKit' or 'Safe Boot.'");
+const CFStringRef kOSKextDiagnosticThirdPartiesIneligibleForDriverKitOSBundleRequired =
+                  CFSTR("Third-party Driver Extensions are ineligible to run in Safe Boot, or "
+                        "match on devices during early boot. Please remove the OSBundleRequired "
+                        "key from your Info.plist.");
+const CFStringRef kOSKextDiagnosticKextIneligibleForDriverKit =
+                  CFSTR("Kexts may not use the DriverKit value for OSBundleRequired.");
+const CFStringRef kOSKextDiagnosticInfoKeyIneligibleForDriverKit =
+                  CFSTR("Driver Extensions may not use the %@ key; please remove.");
+const CFStringRef kOSKextDiagnosticMissingDesignatedKernelClass =
+                  CFSTR("The 'CFBundleIdentifierKernel' key is required in your personality to "
+                        "specify the base kext to load when your kext is instantiated.");
 
 #pragma mark General Private Function Declarations
 /*********************************************************************
 * Private Function Declarations
 *********************************************************************/
+// fileoff is the offset into the kernelcache file
+typedef struct SegInfo {
+    uint64_t    vmaddr;     /* vmaddr of the segment */
+    uint64_t    vmsize;     /* vmsize of the segment */
+    uint64_t    fileoff;    /* file offset of the segment */
+} SegInfo;
+
+// fileoff is the offset into the kernelcache file
+typedef struct plkSegInfo {
+    SegInfo     plkSegInfo;
+    const char *plk_seg_name;
+    uint64_t    plk_next_kext_vmaddr;   /* vmaddr of next kext */
+} plkSegInfo;
+
+typedef struct plkInfo {
+    CFDataRef   kernelImage;
+    CFMutableDataRef   kernelCacheImage; /* kernelcache file */
+    CFMutableSetRef    kaslrOffsets;     /* offsets into kernel cache that need to be slid */
+    SegInfo     kernel_TEXT;    /* kernel __TEXT */
+    plkSegInfo  plk_TEXT;       /* __PRELINK_TEXT */
+    plkSegInfo  plk_TEXT_EXEC;  /* __PLK_TEXT_EXEC */
+    plkSegInfo  plk_DATA;       /* __PRELINK_DATA */
+    plkSegInfo  plk_DATA_CONST; /* __PLK_DATA_CONST */
+    plkSegInfo  plk_LINKEDIT;   /* __PLK_LINKEDIT */
+    plkSegInfo  plk_LLVM_COV;   /* __PLK_LLVM_COV */
+    SegInfo     plk_INFO;       /* __PRELINK_INFO */
+} plkInfo;
+
+__unused static void __OSKextPackKASLROffsets(
+    CFNumberRef value,
+    void *context);
+
+__unused static uint32_t kextcacheFileOffsetToPLKTEXTOffset(
+    uint64_t        kcOffset,
+    plkInfo *       plkInfo);
+
 static void __OSKextInitialize(void);
 
 static OSKextRef   __OSKextAlloc(
@@ -662,6 +857,12 @@ static OSReturn __OSKextLoadWithArgsDict(
     OSKextRef       aKext,
     CFDictionaryRef loadArgsDict);
 #ifndef IOKIT_EMBEDDED
+
+typedef struct __OSKextKXLDCallbackContext {
+    OSKextRef   kext;
+    uint64_t    kernelLoadAddress;
+} __OSKextKXLDCallbackContext;
+
 static Boolean __OSKextGenerateDebugSymbols(
     OSKextRef                aKext,
     CFDataRef                kernelImage,
@@ -669,14 +870,11 @@ static Boolean __OSKextGenerateDebugSymbols(
     KXLDContext            * kxldContext,
     CFMutableDictionaryRef   symbols);
 
-typedef struct __OSKextKXLDCallbackContext {
-    OSKextRef   kext;
-    uint64_t    kernelLoadAddress;
-} __OSKextKXLDCallbackContext;
 static kxld_addr_t __OSKextLinkAddressCallback(
     u_long              size,
     KXLDAllocateFlags * flags,
     void              * user_data);
+
 static void __OSKextLoggingCallback(
     KXLDLogSubsystem    subsystem,
     KXLDLogLevel        level, 
@@ -684,6 +882,7 @@ static void __OSKextLoggingCallback(
     va_list             argList,
     void              * user_data);
 #endif /* !IOKIT_EMBEDDED */
+
 
 OSReturn __OSKextRemovePersonalities(
     OSKextRef   aKext,
@@ -701,10 +900,10 @@ static Boolean __OSKextCreateMkextInfo(OSKextRef aKext);
 static Boolean __OSKextIsValid(OSKextRef aKext);
 static Boolean __OSKextValidate(OSKextRef aKext, CFMutableArrayRef propPath);
 static Boolean __OSKextValidateExecutable(OSKextRef aKext);
-static Boolean __OSKextAuthenticateURLRecursively(
+static Boolean __OSKextBasicFilesystemAuthenticationRecursive(
     OSKextRef aKext,
-    CFURLRef  anURL,
-    CFURLRef  pluginsURL);
+    CFURLRef anURL,
+    CFURLRef pluginsURL);
 
 static CFDictionaryRef __OSKextCopyDiagnosticsDict(
     OSKextRef              aKext,
@@ -778,18 +977,101 @@ static boolean_t __OSKextSwapHeaders(
 static boolean_t __OSKextUnswapHeaders(
     CFDataRef kernelImage);
 static boolean_t __OSKextGetLastKernelLoadAddr(
-    CFDataRef kernelImage, 
-    uint64_t *lastLoadAddrOut);
+                                               CFDataRef kernelImage,
+                                               uint64_t *lastLoadAddrOut);
+
+#if SPLIT_KEXTS_DEBUG
+//static void __OSKextShowMachoHeaderCFData(CFDataRef  kextImage);
+static void __OSKextShowMachoHeader(const UInt8 * imagePtr, CFIndex imageSize);
+//static void __OSKextScanFor(const UInt8 *dataPtr, int count, const UInt8);
+#endif
+static const char * getSegmentCommandName(uint32_t theSegCommand);
+
+static void __OSKextShowPLKInfo(plkInfo *info);
+static Boolean __OSKextIsSplitKext(OSKextRef aKext);
+static Boolean __OSKextIsSplitKextMacho64(struct mach_header_64 *kextHeader);
+
+static Boolean __OSKextConvertExeOfstsToLinkedOfsts(OSKextRef aKext);
+static boolean_t __OSKextHandlePointersForASLR(OSKextRef aKext,
+                                               plkInfo *plkInfo,
+                                               u_char *prelinkData,
+                                               uint64_t segKCOffsets[SEG_IDX_COUNT],
+                                               uintptr_t *pointersForASLR,
+                                               size_t numPointers);
+static boolean_t __OSKextCompactKext(OSKextRef aKext);
+
+static boolean_t __OSKextCopyToPLK(
+    OSKextRef aKext,
+    plkInfo *plkInfo,
+    u_char *prelinkData,
+    uint64_t prelinkDataSize,
+    uint64_t *in_orig_vmaddrs,
+    uint64_t *in_new_vmaddrs,
+    uint64_t *in_kc_offs,
+    uint64_t *out_sizes,
+    Boolean stripSymbolsFlag);
+
+static boolean_t __OSKextInit_plkInfo(
+    CFDataRef kernelImage,
+    CFArrayRef kextArray,
+    plkInfo *plkInfo);
+static boolean_t __OSKextGetPLKSegSizes(
+    CFArrayRef kextArray,
+    plkInfo * segInfo);
+static boolean_t __OSKextSetPLKSegInfo(
+    plkInfo *plkInfo);
+static uint32_t __OSKextGetSegMaxAlignment(
+    struct segment_command_64 * seg_cmd);
+static uint64_t __OSKextAlignAddress(
+    uint64_t address,
+    uint32_t align);
+static boolean_t __OSKextSetLinkInfo(
+    OSKextRef aKext,
+    plkInfo * plkInfo,
+    CFDataRef kextExecutable);
+static boolean_t __OSKextValidatePLKInfo(
+    OSKextRef              aKext,
+    struct mach_header_64 *kextHeader,
+    plkInfo *              plkInfo);
+
+static boolean_t __OSKextGetSegmentInfoForOffset(
+    const UInt8    *imagePtr,
+    uint64_t        fileOffset,
+    char            segnameOut[MAX_SEGNAME_LEN],
+    uint64_t       *segOffsetOut,
+    uint64_t       *vmaddrOut,
+    uint64_t       *vmsizeOut,
+    uint64_t       *fileoffOut,
+    uint64_t       *filesizeOut);
+static boolean_t __OSKextGetSegmentInfo(
+    const UInt8 *   imagePtr,
+    const char *    segname,
+    uint64_t *      vmaddrOut,
+    uint64_t *      vmsizeOut,
+    uint64_t *      fileoffOut,
+    uint64_t *      filesizeOut,
+    uint64_t *      maxAlign,
+    boolean_t       truncateSegs);
+static boolean_t __OSKextGetSegmentAddressAndOffsetDataRef(
+    CFDataRef       imageRef,
+    const char *    segname,
+    uint32_t *      fileOffsetOut,
+    uint64_t *      loadAddrOut);
 static boolean_t __OSKextGetSegmentAddressAndOffset(
-    CFDataRef kernelImage, 
-    const char *segname, 
-    uint32_t *fileOffsetOut, 
-    uint64_t *loadAddrOut);
+    const UInt8 *   imagePtr,
+    const char *    segname,
+    uint32_t *      fileOffsetOut,
+    uint64_t *      loadAddrOut);
+static boolean_t __OSKextGetSegmentFileAndVMSizeDataRef(
+    CFDataRef       imageRef,
+    const char *    segname,
+    uint64_t *      fileSizeOut,
+    uint64_t *      VMSizeOut);
 static boolean_t __OSKextGetSegmentFileAndVMSize(
-    CFDataRef kernelImage, 
-    const char *segname, 
-    uint64_t *fileSizeOut, 
-    uint64_t *VMSizeOut);
+    const UInt8 *   imagePtr,
+    const char *    segname,
+    uint64_t *      fileSizeOut,
+    uint64_t *      VMSizeOut);
 static boolean_t __OSKextSetSegmentAddress(
     CFDataRef kernelImage, 
     const char *segname, 
@@ -806,6 +1088,16 @@ static boolean_t __OSKextSetSegmentFilesize(
     CFDataRef kernelImage, 
     const char *segname, 
     uint64_t filesize);
+static boolean_t __OSKextSetSegmentProtection(
+    CFDataRef kernelImage,
+    const char *segname,
+    vm_prot_t initprot,
+    vm_prot_t maxprot);
+static boolean_t __OSKextMachOSetSegmentProtection(
+    void *header,
+    const char *segname,
+    vm_prot_t initprot,
+    vm_prot_t maxprot);
 static boolean_t __OSKextSetSectionAddress(
     CFDataRef kernelImage, 
     const char *segname, 
@@ -827,33 +1119,51 @@ static Boolean __OSKextCheckForPrelinkedKernel(
     Boolean   needAllFlag,
     Boolean   skipAuthenticationFlag,
     Boolean   printDiagnosticsFlag);
+
+static void __OSKextRemovePLKLinkedit(plkInfo *plkInfo);
+
+static CFArrayRef __OSKextPrelinkSplitKexts(
+                                       CFArrayRef        kextArray,
+                                       plkInfo  *        plkInfo,
+                                       KXLDContext *     kxldContext,
+                                       Boolean           needAllFlag,
+                                       Boolean           skipAuthenticationFlag,
+                                       Boolean           printDiagnosticsFlag,
+                                       Boolean           stripSymbolsFlag);
 static CFArrayRef __OSKextPrelinkKexts(
-    CFArrayRef        kextArray,
-    CFDataRef         kernelImage,
-    uint64_t          loadAddrBase,
-    uint64_t          sourceAddrBase,
-    KXLDContext     * kxldContext,
-    u_long          * loadSizeOut,
-    Boolean           needAllFlag,
-    Boolean           skipAuthenticationFlag,
-    Boolean           printDiagnosticsFlag,
-    Boolean           stripSymbolsFlag);
+                                       CFArrayRef        kextArray,
+                                       CFDataRef         kernelImage,
+                                       uint64_t          loadAddrBase,
+                                       uint64_t          sourceAddrBase,
+                                       KXLDContext     * kxldContext,
+                                       u_long          * loadSizeOut,
+                                       Boolean           needAllFlag,
+                                       Boolean           skipAuthenticationFlag,
+                                       Boolean           printDiagnosticsFlag,
+                                       Boolean           stripSymbolsFlag);
 static CFDataRef __OSKextCreatePrelinkInfoDictionary(
+    plkInfo   *plkInfo,
     CFArrayRef loadList,
     CFURLRef   volumeRootURL,
-    Boolean includeAllPersonalities);
+    Boolean    includeAllPersonalities,
+    Boolean    isSplitKexts,
+    CFDataRef  kernelUUID);
 static Boolean __OSKextRequiredAtEarlyBoot(
     OSKextRef   theKext);
-static u_long __OSKextCopyPrelinkedKexts(
-    CFMutableDataRef prelinkImage,
-    CFArrayRef loadList,
-    u_long fileOffsetBase,
-    uint64_t sourceAddrBase);
+
+static Boolean __OSKextCopySplitPrelinkInfoDictionary(
+     plkInfo  *  plkInfo,
+     CFDataRef   prelinkInfoData);
 static u_long __OSKextCopyPrelinkInfoDictionary(
     CFMutableDataRef prelinkImage,
     CFDataRef prelinkInfoData,
     u_long fileOffset,
     uint64_t sourceAddr);
+static u_long __OSKextCopyPrelinkedKexts(
+    CFMutableDataRef prelinkImage,
+    CFArrayRef       loadList,
+    u_long           fileOffsetBase,
+    uint64_t         sourceAddrBase);
 
 static Boolean _excludeThisVersion(OSKextVersion theKextVers,
                                    CFStringRef theExcludedKextVers);
@@ -876,6 +1186,8 @@ static bool __OSKextShouldLog(
 Boolean _isArray(CFTypeRef);
 Boolean _isDictionary(CFTypeRef);
 Boolean _isString(CFTypeRef);
+
+__unused static boolean_t __OSKextWantKextsFirst(CFDataRef kernelImage);
 
 #pragma mark Function-Like Macros
 /*********************************************************************
@@ -915,21 +1227,293 @@ static const CFRuntimeClass __OSKextClass = {
 #endif
 };
 
+struct max_data {
+    int n;
+    struct {
+        char name[MAX_SEGNAME_LEN];
+        uint64_t vmaddr;
+        uint64_t vmsz;
+        uint64_t max_off;
+    } seg_data[SEG_IDX_COUNT];
+};
+
+static uint64_t getKCPlkSegVMSize(plkInfo *plkInfo, enum enumSegIdx idx) {
+    assert(plkInfo);
+
+    switch (idx) {
+    case SEG_IDX_TEXT:
+        return plkInfo->plk_TEXT.plkSegInfo.vmsize;
+    case SEG_IDX_TEXT_EXEC:
+        return plkInfo->plk_TEXT_EXEC.plkSegInfo.vmsize;
+    case SEG_IDX_DATA:
+        return plkInfo->plk_DATA.plkSegInfo.vmsize;
+    case SEG_IDX_DATA_CONST:
+        return plkInfo->plk_DATA_CONST.plkSegInfo.vmsize;
+    case SEG_IDX_LINKEDIT:
+        return plkInfo->plk_LINKEDIT.plkSegInfo.vmsize;
+    case SEG_IDX_LLVM_COV:
+        return plkInfo->plk_LLVM_COV.plkSegInfo.vmsize;
+    default:
+        /* shouldn't ever be here */
+        assert(false);
+        return 0;
+    }
+}
+
+__unused static boolean_t setKCPlkSegVMSize(plkInfo *plkInfo, enum enumSegIdx idx, uint64_t x) {
+    assert(plkInfo);
+
+    switch (idx) {
+    case SEG_IDX_TEXT:
+        plkInfo->plk_TEXT.plkSegInfo.vmsize = x;
+    break;
+    case SEG_IDX_TEXT_EXEC:
+        plkInfo->plk_TEXT_EXEC.plkSegInfo.vmsize = x;
+    break;
+    case SEG_IDX_DATA:
+        plkInfo->plk_DATA.plkSegInfo.vmsize = x;
+    break;
+    case SEG_IDX_DATA_CONST:
+        plkInfo->plk_DATA_CONST.plkSegInfo.vmsize = x;
+    break;
+    case SEG_IDX_LINKEDIT:
+        plkInfo->plk_LINKEDIT.plkSegInfo.vmsize = x;
+    break;
+    case SEG_IDX_LLVM_COV:
+        plkInfo->plk_LLVM_COV.plkSegInfo.vmsize = x;
+    break;
+    default:
+        /* shouldn't ever be here */
+        assert(false);
+        return false;
+    }
+
+    return true;
+}
+
+/* return kernel cache segment base vmaddr */
+static uint64_t getKCPlkSegVMAddr(plkInfo *plkInfo, enum enumSegIdx idx) {
+    assert(plkInfo);
+
+    switch (idx) {
+    case SEG_IDX_TEXT:
+        return plkInfo->plk_TEXT.plkSegInfo.vmaddr;
+    case SEG_IDX_TEXT_EXEC:
+        return plkInfo->plk_TEXT_EXEC.plkSegInfo.vmaddr;
+    case SEG_IDX_DATA:
+        return plkInfo->plk_DATA.plkSegInfo.vmaddr;
+    case SEG_IDX_DATA_CONST:
+        return plkInfo->plk_DATA_CONST.plkSegInfo.vmaddr;
+    case SEG_IDX_LINKEDIT:
+        return plkInfo->plk_LINKEDIT.plkSegInfo.vmaddr;
+    case SEG_IDX_LLVM_COV:
+        return plkInfo->plk_LLVM_COV.plkSegInfo.vmaddr;
+    default:
+        /* shouldn't ever be here */
+        assert(false);
+        return false;
+    }
+}
+
+/* return kernel cache segment base file offset */
+static uint64_t getKCPlkSegFileOff(plkInfo *plkInfo, enum enumSegIdx idx) {
+    assert(plkInfo);
+
+    switch (idx) {
+    case SEG_IDX_TEXT:
+        return plkInfo->plk_TEXT.plkSegInfo.fileoff;
+    case SEG_IDX_TEXT_EXEC:
+        return plkInfo->plk_TEXT_EXEC.plkSegInfo.fileoff;
+    case SEG_IDX_DATA:
+        return plkInfo->plk_DATA.plkSegInfo.fileoff;
+    case SEG_IDX_DATA_CONST:
+        return plkInfo->plk_DATA_CONST.plkSegInfo.fileoff;
+    case SEG_IDX_LINKEDIT:
+        return plkInfo->plk_LINKEDIT.plkSegInfo.fileoff;
+    case SEG_IDX_LLVM_COV:
+        return plkInfo->plk_LLVM_COV.plkSegInfo.fileoff;
+    default:
+        /* shouldn't ever be here */
+        assert(false);
+        return false;
+    }
+}
+
+static uint64_t getKCPlkSegNextVMAddr(plkInfo *plkInfo, enum enumSegIdx idx) {
+    assert(plkInfo);
+
+    switch (idx) {
+    case SEG_IDX_TEXT:
+        return plkInfo->plk_TEXT.plk_next_kext_vmaddr;
+    case SEG_IDX_TEXT_EXEC:
+        return plkInfo->plk_TEXT_EXEC.plk_next_kext_vmaddr; 
+    case SEG_IDX_DATA:
+        return plkInfo->plk_DATA.plk_next_kext_vmaddr;
+    case SEG_IDX_DATA_CONST:
+        return plkInfo->plk_DATA_CONST.plk_next_kext_vmaddr;
+    case SEG_IDX_LINKEDIT:
+        return plkInfo->plk_LINKEDIT.plk_next_kext_vmaddr;
+    case SEG_IDX_LLVM_COV:
+        return plkInfo->plk_LLVM_COV.plk_next_kext_vmaddr;
+    default:
+        /* shouldn't ever be here */
+        assert(false);
+        return 0;
+    }
+}
+
+__unused static boolean_t setKCPlkSegNextVMAddr(plkInfo *plkInfo, enum enumSegIdx idx, uint64_t x) {
+    if (!plkInfo)
+        return false;
+
+    switch (idx) {
+    case SEG_IDX_TEXT:
+        plkInfo->plk_TEXT.plk_next_kext_vmaddr = x;
+        return true;
+    case SEG_IDX_TEXT_EXEC:
+        plkInfo->plk_TEXT_EXEC.plk_next_kext_vmaddr = x; 
+        return true;
+    case SEG_IDX_DATA:
+        plkInfo->plk_DATA.plk_next_kext_vmaddr = x; 
+        return true;
+    case SEG_IDX_DATA_CONST:
+        plkInfo->plk_DATA_CONST.plk_next_kext_vmaddr = x;
+        return true;
+    case SEG_IDX_LINKEDIT:
+        plkInfo->plk_LINKEDIT.plk_next_kext_vmaddr = x;
+        return true;
+    case SEG_IDX_LLVM_COV:
+        plkInfo->plk_LLVM_COV.plk_next_kext_vmaddr = x;
+        return true;
+    default:
+        /* shouldn't ever be here */
+        assert(false);
+        return false;
+    }
+}
+
+__unused static boolean_t setKextVMAddr(OSKextRef aKext, enum enumSegIdx idx, uint64_t vmaddr) {
+    if (!aKext)
+        return false;
+
+    switch (idx) {
+    case SEG_IDX_TEXT:
+        aKext->loadInfo->linkInfo.vmaddr_TEXT = vmaddr; 
+        return true;
+    case SEG_IDX_TEXT_EXEC:
+        aKext->loadInfo->linkInfo.vmaddr_TEXT_EXEC = vmaddr;
+        return true;
+    case SEG_IDX_DATA:
+        aKext->loadInfo->linkInfo.vmaddr_DATA = vmaddr; 
+        return true;
+    case SEG_IDX_DATA_CONST:
+        aKext->loadInfo->linkInfo.vmaddr_DATA_CONST = vmaddr;
+        return true;
+    case SEG_IDX_LINKEDIT:
+        aKext->loadInfo->linkInfo.vmaddr_LINKEDIT = vmaddr;
+        return true;
+    case SEG_IDX_LLVM_COV:
+        aKext->loadInfo->linkInfo.vmaddr_LLVM_COV = vmaddr;
+        return true;
+    default:
+        /* shouldn't ever be here */
+        assert(false);
+        return false;
+    }
+}
+
+__unused static uint64_t getKextVMAddr(OSKextRef aKext, enum enumSegIdx idx) {
+    assert(aKext);
+
+    switch (idx) {
+    case SEG_IDX_TEXT:
+        return aKext->loadInfo->linkInfo.vmaddr_TEXT;
+    case SEG_IDX_TEXT_EXEC:
+        return aKext->loadInfo->linkInfo.vmaddr_TEXT_EXEC;
+    case SEG_IDX_DATA:
+        return aKext->loadInfo->linkInfo.vmaddr_DATA;
+    case SEG_IDX_DATA_CONST:
+        return aKext->loadInfo->linkInfo.vmaddr_DATA_CONST;
+    case SEG_IDX_LINKEDIT:
+        return aKext->loadInfo->linkInfo.vmaddr_LINKEDIT;
+    case SEG_IDX_LLVM_COV:
+        return aKext->loadInfo->linkInfo.vmaddr_LLVM_COV;
+    default:
+        /* shouldn't ever be here */
+        assert(false);
+        return 0;
+    }
+}
+
+__unused static boolean_t getSegIndex(const char *name, enum enumSegIdx *idx) {
+    if (!strcmp(name, "__TEXT")) {
+        if (idx) 
+            *idx = SEG_IDX_TEXT;
+        return true;
+    } else if (!strcmp(name, "__TEXT_EXEC")) {
+        if (idx)
+            *idx = SEG_IDX_TEXT_EXEC;
+        return true;
+    } else if (!strcmp(name, "__DATA")) {
+        if (idx)
+            *idx = SEG_IDX_DATA;
+        return true;
+    } else if (!strcmp(name, "__DATA_CONST")) {
+        if (idx)
+            *idx = SEG_IDX_DATA_CONST;
+        return true;
+    } else if (!strcmp(name, "__LINKEDIT")) {
+        if (idx)
+            *idx = SEG_IDX_LINKEDIT;
+        return true;
+    } else if (!strcmp(name, "__LLVM_COV")) {
+        if (idx)
+            *idx = SEG_IDX_LLVM_COV;
+        return true;
+    } else {
+        return false;
+    }
+}
+
+static char * segIdxToName(enum enumSegIdx idx) {
+    switch (idx) {
+    case SEG_IDX_TEXT:
+        return "__TEXT";
+    case SEG_IDX_TEXT_EXEC:
+        return "__TEXT_EXEC";
+    case SEG_IDX_DATA:
+        return "__DATA";
+    case SEG_IDX_DATA_CONST:
+        return "__DATA_CONST";
+    case SEG_IDX_LINKEDIT:
+        return "__LINKEDIT";
+    case SEG_IDX_LLVM_COV:
+        return "__LLVM_COV";
+    default:
+        return NULL;
+    }
+}
+
 /*********************************************************************
 *********************************************************************/
 static void __OSKextInitialize(void)
 {
-    CFTypeRef packageTypeValues[] = { CFSTR("KEXT") };
+    CFTypeRef packageTypeValues[] = {
+        __kOSKextBundlePackageTypeKext,
+        __kOSKextBundlePackageTypeDriverKit,
+    };
     CFTypeRef bundleRequiredValues[] = {
         CFSTR(kOSBundleRequiredRoot),
         CFSTR(kOSBundleRequiredLocalRoot),
         CFSTR(kOSBundleRequiredNetworkRoot),
         CFSTR(kOSBundleRequiredSafeBoot),
         CFSTR(kOSBundleRequiredConsole),
+        CFSTR(kOSBundleRequiredDriverKit),
     };
     CFTypeRef essentialInfoKeys[] = {
         kCFBundleIdentifierKey,
         kCFBundleVersionKey,
+        _kCFBundlePackageTypeKey,
         CFSTR(kOSBundleCompatibleVersionKey),
         CFSTR(kOSBundleIsInterfaceKey),
         CFSTR(kOSKernelResourceKey),
@@ -947,13 +1531,24 @@ static void __OSKextInitialize(void)
         CFSTR(kOSBundleDependenciesKey),
         CFSTR(kOSBundleRetainCountKey)
     };
+
+    /* For kexts only, not dexts. */
+    CFTypeRef kextInfoKeys[] = {
+        CFSTR(kOSKernelResourceKey),
+        CFSTR(kAppleSecurityExtensionKey),
+        CFSTR(kAppleKernelExternalComponentKey),
+        CFSTR(kOSBundleSharedExecutableIdentifierKey),
+        CFSTR(kOSBundleIsInterfaceKey),
+    };
+
     CFAllocatorContext nonrefcountAllocatorContext;
     CFAllocatorRef     nonrefcountAllocator = NULL;  // must release
 
     // must release each
-    CFURLRef  extensionsDirs[_kOSKextNumSystemExtensionsFolders] = { 0, 0 };
+    CFURLRef  extensionsDirs[_kOSKextNumSystemExtensionsFolders] = {0};
 
-    int    numValues;
+    struct stat sb;
+    int    numValues = 0;
 
    /* Prevent deadlock when calling other functions that might think they
     * need to initialize.
@@ -971,28 +1566,76 @@ static void __OSKextInitialize(void)
         OSKextLogMemError();
         goto finish;
     }
-    
-    extensionsDirs[0] = CFURLCreateFromFileSystemRepresentation(
+
+    extensionsDirs[numValues++] = CFURLCreateFromFileSystemRepresentation(
                 nonrefcountAllocator,
                 (const UInt8 *)_kOSKextSystemLibraryExtensionsFolder,
                 strlen(_kOSKextSystemLibraryExtensionsFolder),
                 /* isDir */ true);
     
-    extensionsDirs[1] = CFURLCreateFromFileSystemRepresentation(
+    extensionsDirs[numValues++] = CFURLCreateFromFileSystemRepresentation(
                 nonrefcountAllocator,
                 (const UInt8 *)_kOSKextLibraryExtensionsFolder,
                 strlen(_kOSKextLibraryExtensionsFolder),
                 /* isDir */ true);
-    
+
+    /* /System/Library/DriverExtensions may not exist on older systems.
+     * Don't add it if it doesn't exist, in case we end up doing operations
+     * on older volumes.
+     */
+    if (stat(_kOSKextSystemLibraryDriverExtensionsFolder, &sb) == 0) {
+        extensionsDirs[numValues++] = CFURLCreateFromFileSystemRepresentation(
+                    nonrefcountAllocator,
+                    (const UInt8 *)_kOSKextSystemLibraryDriverExtensionsFolder,
+                    strlen(_kOSKextSystemLibraryDriverExtensionsFolder),
+                    /* isDir */ true);
+    }
+
+    if (stat(_kOSKextLibraryDriverExtensionsFolder, &sb) == 0) {
+        extensionsDirs[numValues++] = CFURLCreateFromFileSystemRepresentation(
+                    nonrefcountAllocator,
+                    (const UInt8 *)_kOSKextLibraryDriverExtensionsFolder,
+                    strlen(_kOSKextLibraryDriverExtensionsFolder),
+                    /* isDir */ true);
+    }
+
+    if (stat(_kOSKextLibraryAppleExtensionsFolder, &sb) == 0) {
+        extensionsDirs[numValues++] = CFURLCreateFromFileSystemRepresentation(
+                    nonrefcountAllocator,
+                    (const UInt8 *)_kOSKextLibraryAppleExtensionsFolder,
+                    strlen(_kOSKextLibraryAppleExtensionsFolder),
+                    /* isDir */ true);
+    }
+
+    /* /AppleInternal/Library/Extensions may not exist.  Avoid adding
+     * it in that case, to avoid confusing the various tools that consume
+     * this array and expect all kext repos to exist.  We generally assume
+     * that this won't be created post-boot.  In the unlikely case that it
+     * is, any tools/daemons that consume OSKextLib will need to be reloaded
+     * to catch the new directory.
+     */
+    if (stat(_kOSKextAppleInternalLibraryExtensionsFolder, &sb) == 0) {
+        extensionsDirs[numValues++] = CFURLCreateFromFileSystemRepresentation(
+                    nonrefcountAllocator,
+                    (const UInt8 *)_kOSKextAppleInternalLibraryExtensionsFolder,
+                    strlen(_kOSKextAppleInternalLibraryExtensionsFolder),
+                    /* isDir */ true);
+    }
+
+    for (int i = 0; i < numValues; ++i) {
+        if (extensionsDirs[i] == NULL) {
+            OSKextLogMemError();
+            goto finish;
+        }
+    }
+
     __sOSKextSystemExtensionsFolderURLs = CFArrayCreate(
                     nonrefcountAllocator,
                     (const void **)extensionsDirs,
-                    _kOSKextNumSystemExtensionsFolders,
+                    numValues,
                     &kCFTypeArrayCallBacks);
-    
-    if (!extensionsDirs[0] ||
-        !extensionsDirs[1] ||
-        !__sOSKextSystemExtensionsFolderURLs) {
+
+    if (!__sOSKextSystemExtensionsFolderURLs) {
         OSKextLogMemError();
         goto finish;
     }
@@ -1009,6 +1652,10 @@ static void __OSKextInitialize(void)
     numValues = sizeof(essentialInfoKeys) / sizeof(void *);
     __sOSKextInfoEssentialKeys = CFArrayCreate(kCFAllocatorDefault,
         essentialInfoKeys, numValues, &kCFTypeArrayCallBacks);
+
+    numValues = sizeof(kextInfoKeys) / sizeof(void *);
+    __sOSKextInfoKextOnlyKeys = CFArrayCreate(kCFAllocatorDefault,
+        kextInfoKeys, numValues, &kCFTypeArrayCallBacks);
 
    /* This module keeps track of all open kexts by both URL and bundle ID,
     * in dictionaries that do not retain/release so that we do cleanup on
@@ -1124,6 +1771,7 @@ static void __OSKextReleaseContents(CFTypeRef cfObject)
     */
     SAFE_RELEASE_NULL(aKext->bundleURL);
     SAFE_RELEASE_NULL(aKext->bundleID);
+    SAFE_RELEASE_NULL(aKext->executableURL);
     SAFE_RELEASE_NULL(aKext->infoDictionary);
 
     return;
@@ -1394,6 +2042,255 @@ static Boolean __OSKextIsArchitectureLP64(void)
 }
 
 /*********************************************************************
+ *********************************************************************/
+__unused static Boolean __OSKextIsSplitKext(OSKextRef aKext)
+{
+    if (aKext && aKext->loadInfo && aKext->loadInfo->linkInfo.vmaddr_TEXT_EXEC != 0) {
+        return true;
+    }
+    return false;
+}
+
+/*********************************************************************
+ *********************************************************************/
+__unused static Boolean __OSKextIsSplitKextMacho64(struct mach_header_64 *kextHeader)
+{
+    struct segment_command_64 *seg_cmd = NULL;
+    if (!kextHeader)
+        return false;
+
+    seg_cmd = macho_get_segment_by_name_64(kextHeader, SEG_TEXT_EXEC);
+    if (seg_cmd != NULL) {
+        return true;
+    }
+    return false;
+}
+
+/*********************************************************************
+*********************************************************************/
+
+CFURLRef OSKextGetExecutableURL(OSKextRef aKext)
+{
+    CFURLRef                 executableURL              = NULL;  // must release
+    CFURLRef                 newURL                     = NULL;  // do not release
+    CFStringRef              path                       = NULL;  // must release
+    CFStringRef              executableName             = NULL;  // do not release
+    struct stat              executableStat;
+    char                     kextPath[PATH_MAX];
+    char                     executablePath[PATH_MAX];
+    char                     suffix[MAX_SUFFIX_LEN];
+
+    if (aKext->executableURL) {
+        return aKext->executableURL;
+    }
+
+   __OSKextGetFileSystemPath(aKext, /* otherURL */ NULL,
+       /* resolveToBase */ true, kextPath);
+
+    // xxx - this bit might warrant a kOSKextLogFileAccessFlag message
+    OSKextLog(aKext,
+        kOSKextLogDebugLevel | kOSKextLogFileAccessFlag,
+        "Checking CFBundle of %s for executable URL.",
+         kextPath);
+    executableURL = _CFBundleCopyExecutableURLInDirectory(OSKextGetURL(aKext));
+
+   /* Did we fail to get an executable URL, even though the kext has a
+    * CFBundleExecutable? Tag the kext with a diagnostic.
+    */
+    if (!executableURL) {
+        executableName = OSKextGetValueForInfoDictionaryKey(aKext,
+            kCFBundleExecutableKey);
+
+        if (executableName) {
+            __OSKextAddDiagnostic(aKext,
+                kOSKextDiagnosticsFlagValidation,
+                kOSKextDiagnosticExecutableMissingKey,
+                executableName, /* note */ NULL);
+            goto finish;
+        }
+    }
+
+#if SHARED_EXECUTABLE
+   /* No executable URL? Check for a shared executable and nab
+    * a copy direct from the owning kext.
+    */
+    if (!executableURL) {
+        CFStringRef sharedExecutableIdentifier = NULL;  // do not release
+        sharedExecutableIdentifier = OSKextGetValueForInfoDictionaryKey(
+            aKext, CFSTR(kOSBundleSharedExecutableIdentifierKey));
+        if (sharedExecutableIdentifier) {
+
+            // xxx - does not handle multiple versions/duplicates!
+            OSKextRef sharedExecutableKext =
+                OSKextGetKextWithIdentifier(sharedExecutableIdentifier);
+            if (sharedExecutableKext) {
+                executableURL = _CFBundleCopyExecutableURLInDirectory(
+                        OSKextGetURL(sharedExecutableKext));
+            } else {
+                __OSKextAddDiagnostic(aKext,
+                    kOSKextDiagnosticsFlagValidation,
+                    kOSKextDiagnosticSharedExecutableKextMissingKey,
+                    sharedExecutableIdentifier, /* note */ NULL);
+                goto finish;
+            }
+        }
+    }
+#endif
+
+    /* If there's a target specified, we search in the info dict for a target-specific
+     * kext variant override.
+     */
+    bzero(suffix, sizeof(suffix));
+    if (executableURL && __sOSKextTargetString) {
+        // Get the override dict.
+        CFDictionaryRef overrideDict = OSKextGetValueForInfoDictionaryKey(aKext, CFSTR(kOSKextVariantOverrideKey));
+
+        if (overrideDict) {
+            // See if we have a target-specific override for the current target.
+            if (CFDictionaryContainsKey(overrideDict, __sOSKextTargetString)) {
+                // If so, we use this as a suffix.
+                CFStringRef suffixStr = CFDictionaryGetValue(overrideDict, __sOSKextTargetString);
+
+                if (suffixStr) {
+                    Boolean result = CFStringGetCString(suffixStr, suffix, sizeof(suffix), kCFStringEncodingUTF8);
+                    if (!result) {
+                        // On failure, reset suffix to zero to fall back to global suffix.
+                        bzero(suffix, sizeof(suffixStr));
+                    }
+                }
+            }
+        }
+    }
+
+    // Fall back to global variant string.
+    if (!suffix[0]) {
+        strlcpy(suffix, OSKextExecutableVariant, MAX_SUFFIX_LEN);
+    }
+
+
+    // Assemble the executable URL.
+    if (executableURL && suffix[0]) {
+        if (!__OSKextGetFileSystemPath(/* kext */ NULL,
+            executableURL, /* resolveToBase */ true, executablePath)) {
+            goto finish;
+        }
+
+        size_t len = strlen(executablePath);
+        strlcpy(executablePath + len, suffix, sizeof(executablePath) - len);
+        OSKextLog(aKext,
+            kOSKextLogDebugLevel | kOSKextLogFileAccessFlag,
+            "Statting %s for suffix.",
+            executablePath);
+        if (!stat(executablePath, &executableStat)) {
+            path = CFStringCreateWithCString(
+            CFGetAllocator(aKext), executablePath,
+            kCFStringEncodingUTF8);
+            if (path) {
+                newURL = CFURLCreateWithFileSystemPath(CFGetAllocator(aKext),
+                path, kCFURLPOSIXPathStyle, false);
+                CFRelease(path);
+            }
+            if (newURL) {
+                CFRelease(executableURL);
+                executableURL = newURL;
+            }
+        }
+    }
+
+    if (!executableURL) {
+        goto finish;
+    }
+    aKext->executableURL = CFRetain(executableURL);
+
+finish:
+    SAFE_RELEASE(executableURL);
+    return aKext->executableURL;
+}
+
+CFURLRef OSKextGetKernelExecutableURL(OSKextRef aKext)
+{
+    if (OSKextDeclaresUserExecutable(aKext)) {
+        return NULL;
+    }
+    return OSKextGetExecutableURL(aKext);
+}
+
+CFURLRef OSKextGetUserExecutableURL(OSKextRef aKext)
+{
+    if (!OSKextDeclaresUserExecutable(aKext)) {
+        return NULL;
+    }
+    return OSKextGetExecutableURL(aKext);
+}
+
+/*********************************************************************
+*********************************************************************/
+
+void OSKextSetExecutableSuffix(const char * suffix, const char * kernelPath)
+{
+    const char * nsuffix;
+    size_t       len;
+    char *       file;
+    char *       copy;
+
+    if (suffix) {
+        strlcpy(OSKextExecutableVariant, suffix, sizeof(OSKextExecutableVariant));
+    } else if (kernelPath) {
+        copy = strndup(kernelPath, MAXPATHLEN);
+        if (copy)
+        {
+            file = basename(copy);
+            if (file && (suffix = strchr(file, '.'))) {
+                suffix++;
+                nsuffix = strchr(suffix, '.');
+                len = nsuffix ? (nsuffix - suffix) : strlen(suffix);
+                len += 2;
+                if (len > sizeof(OSKextExecutableVariant)) len = sizeof(OSKextExecutableVariant);
+                snprintf(OSKextExecutableVariant, len, "_%s", suffix);
+            }
+            free(copy);
+        }
+    }
+    if (!suffix) {
+        OSKextExecutableVariant[0] = 0;
+    }
+}
+
+/*********************************************************************
+*********************************************************************/
+
+Boolean OSKextSetTargetString(const char * targetString)
+{
+    CFStringRef newTargetString = NULL;
+
+    if (__sOSKextTargetString) {
+        SAFE_RELEASE_NULL(__sOSKextTargetString);
+    }
+
+    newTargetString = CFStringCreateWithCString(kCFAllocatorDefault,
+        targetString, kCFStringEncodingUTF8);
+
+    if (!newTargetString) {
+        OSKextLog(NULL,
+                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                  "%s %d - cannot allocate memory for target string",
+                  __func__, __LINE__);
+        return false;
+    }
+
+    __sOSKextTargetString = newTargetString;
+    return true;
+}
+
+/*********************************************************************
+*********************************************************************/
+
+CFStringRef OSKextGetTargetString()
+{
+    return __sOSKextTargetString;
+}
+
+/*********************************************************************
 *********************************************************************/
 void OSKextSetLogFilter(
     OSKextLogSpec logFilter,
@@ -1566,7 +2463,46 @@ void _OSKextSetStrictRecordingByLastOpened(Boolean flag)
     return;
 }
 
+/*********************************************************************
+ *********************************************************************/
+void _OSKextSetStrictAuthentication(Boolean flag)
+{
+    __sOSKextStrictAuthentication = flag;
+    return;
+}
 
+/*********************************************************************
+ * An interface to set the authentication function used by
+ * OSKextAuthenticate in the current context.
+ *********************************************************************/
+void _OSKextSetAuthenticationFunction(OSKextAuthFnPtr authFn, void *context)
+{
+    __sOSKextAuthenticationFunction = authFn;
+    __sOSKextAuthenticationContext = context;
+    return;
+}
+
+/*********************************************************************
+ * An interface to set the load audit function, used by OSKextLoad
+ * in the current context for monitoring kext load information.
+ *********************************************************************/
+void _OSKextSetLoadAuditFunction(OSKextLoadAuditFnPtr authFn)
+{
+    __sOSKextLoadAuditFunction = authFn;
+    return;
+}
+
+/*********************************************************************
+ * An interface to set the personality patcher function, used by
+ * OSKextCopyPersonalitiesOfKexts and OSKextCopyPersonalitiesArray
+ * in the current context for setting keys in personalities before
+ * they are returned, or sent down to the kernel.
+ *********************************************************************/
+void _OSKextSetPersonalityPatcherFunction(OSKextPersonalityPatcherFnPtr patcherFn)
+{
+    __sOSKextPersonalityPatcherFunction = patcherFn;
+    return;
+}
 
 #pragma mark Instance Management
 /*********************************************************************
@@ -2130,30 +3066,51 @@ OSKextRef OSKextCreate(
     CFAllocatorRef allocator,
     CFURLRef       anURL)
 {
-    OSKextRef   result       = NULL;
+    OSKextRef   result        = NULL;
     CFStringRef pathExtension = NULL;  // must release
-    char        relPath[PATH_MAX];
+    CFURLRef    realURL       = NULL;
+    char        absPath[PATH_MAX];
+    char        realPath[PATH_MAX];
 
     pthread_once(&__sOSKextInitialized, __OSKextInitialize);
 
     pathExtension = CFURLCopyPathExtension(anURL);
-    if (!pathExtension || !CFEqual(pathExtension, CFSTR(kOSKextBundleExtension))) {
+    if (!pathExtension || !(CFEqual(pathExtension, CFSTR(kOSKextBundleExtension)) ||
+                            CFEqual(pathExtension, CFSTR(kOSKextDriverKitBundleExtension)))) {
         goto finish;
     }
 
     if (!__OSKextGetFileSystemPath(/* kext */ NULL, /* otherURL */ anURL,
-            /* resolveToBase */ false, relPath)) {
-            
+            /* resolveToBase */ true, absPath)) {
+
         goto finish;
     }
 
-    result = OSKextGetKextWithURL(anURL);
+    if (!realpath(absPath, realPath)) {
+        OSKextLog(/* kext */ NULL,
+            kOSKextLogErrorLevel | kOSKextLogFileAccessFlag,
+            "Unable to determine realpath for %s - failing.",
+            absPath);
+        goto finish;
+    }
+
+    realURL = CFURLCreateFromFileSystemRepresentation(
+                    kCFAllocatorDefault,
+                    (uint8_t *)realPath,
+                    strlen(realPath),
+                    /* isDirectory? */ true);
+    if (!realURL) {
+        OSKextLogMemError();
+        goto finish;
+    }
+
+    result = OSKextGetKextWithURL(realURL);
     if (result) {
         OSKextLog(/* kext */ NULL,
             kOSKextLogDebugLevel |
             kOSKextLogKextBookkeepingFlag | kOSKextLogFileAccessFlag,
             "%s is already open; returning existing object.",
-            relPath);
+            absPath);
         CFRetain(result);
         goto finish;
     }
@@ -2162,19 +3119,20 @@ OSKextRef OSKextCreate(
         kOSKextLogDebugLevel |
         kOSKextLogKextBookkeepingFlag | kOSKextLogFileAccessFlag,
         "Creating %s.",
-        relPath);
+        realPath);
 
     result = __OSKextAlloc(allocator, /* context */ NULL);
     if (!result) {
         OSKextLogMemError();
         goto finish;
     }
-    if (!__OSKextInitWithURL(result, anURL)) {
+    if (!__OSKextInitWithURL(result, realURL)) {
         SAFE_RELEASE_NULL(result);
         goto finish;
     }
 
 finish:
+    SAFE_RELEASE(realURL);
     SAFE_RELEASE(pathExtension);
     return result;
 }
@@ -2202,8 +3160,8 @@ CFMutableArrayRef __OSKextCreateKextsFromURL(
    /* Check for a single kext, read it and its plugins.
     */
     pathExtension = CFURLCopyPathExtension(anURL);
-    if (pathExtension && CFEqual(pathExtension,
-        CFSTR(kOSKextBundleExtension))) {
+    if (pathExtension && (CFEqual(pathExtension, CFSTR(kOSKextBundleExtension)) ||
+                          CFEqual(pathExtension, CFSTR(kOSKextDriverKitBundleExtension)))) {
 
         result = CFArrayCreateMutable(allocator, 0, &kCFTypeArrayCallBacks);
         if (!result) {
@@ -2295,11 +3253,11 @@ CFMutableArrayRef __OSKextCreateKextsFromURL(
         SAFE_RELEASE_NULL(kexts);
 
         pathExtension = CFURLCopyPathExtension(thisURL);
-        if (pathExtension && CFEqual(pathExtension,
-            CFSTR(kOSKextBundleExtension))) {
+        if (pathExtension && (CFEqual(pathExtension, CFSTR(kOSKextBundleExtension)) ||
+                              CFEqual(pathExtension, CFSTR(kOSKextDriverKitBundleExtension)))) {
 
             char kextURLPath[PATH_MAX];
-            
+
             __OSKextGetFileSystemPath(/* kext */ NULL, thisURL,
                 /* resolveToBase */ FALSE, kextURLPath);
 
@@ -2628,14 +3586,17 @@ OSKextRef __OSKextCreateFromIdentifierCacheDict(
     CFStringRef   bundleID           = NULL;  // do not release
     CFStringRef   bundlePath         = NULL;  // do not release
     CFStringRef   bundleVersion      = NULL;  // do not release
-    CFStringRef   fullPath           = NULL;  // must release
+    CFStringRef   bundleType         = NULL;  // do not release
+    CFStringRef   fullPath           = NULL;  // must SAFE_RELEASE
+    CFBooleanRef  isAbsolute         = NULL;  // do not release
     CFURLRef      bundleURL          = NULL;  // must release
     OSKextVersion kextVersion        = -1;
     CFBooleanRef  scratchBool        = NULL;  // do not release
+    Boolean       bundleIsDext       = FALSE;
     char          kextPath[PATH_MAX];
 
     bundlePath = (CFStringRef)CFDictionaryGetValue(cacheDict,
-        CFSTR("OSBundlePath"));
+        CFSTR(kOSBundlePathKey));
     if (!bundlePath || (CFGetTypeID(bundlePath) != CFStringGetTypeID())) {
         OSKextLog(/* kext */ NULL,
             kOSKextLogErrorLevel | kOSKextLogKextBookkeepingFlag,
@@ -2644,10 +3605,11 @@ OSKextRef __OSKextCreateFromIdentifierCacheDict(
             (int)entryIndex);
         goto finish;
     }
-    
+
    /* Reject any non-.kext path.
     */
-    if (!CFStringHasSuffix(bundlePath, CFSTR(kOSKextBundleExtension))) {
+    if (!(CFStringHasSuffix(bundlePath, CFSTR(kOSKextBundleExtension)) ||
+          CFStringHasSuffix(bundlePath, CFSTR(kOSKextDriverKitBundleExtension)))) {
         OSKextLog(/* kext */ NULL,
             kOSKextLogErrorLevel | kOSKextLogKextBookkeepingFlag,
             "Can't create kext: path in identifier cache entry %d "
@@ -2655,21 +3617,31 @@ OSKextRef __OSKextCreateFromIdentifierCacheDict(
             (int)entryIndex);
         goto finish;
     }
-    
-    fullPath = CFStringCreateWithFormat(allocator,
-        /* options */ 0, CFSTR("%@/%@"), basePath, bundlePath);
-     if (!fullPath) {
-        OSKextLogMemError();
-        goto finish;
-     }
- 
-    bundleURL = CFURLCreateWithFileSystemPath(allocator,
-        fullPath, kCFURLPOSIXPathStyle, /* isDir */ true);
+
+    isAbsolute = (CFBooleanRef)CFDictionaryGetValue(cacheDict,
+                    CFSTR("OSBundleUsesAbsolutePath"));
+    if (!isAbsolute ||
+        (CFGetTypeID(isAbsolute) != CFBooleanGetTypeID()) ||
+        !CFBooleanGetValue(isAbsolute)) {
+
+        fullPath = CFStringCreateWithFormat(allocator,
+            /* options */ 0, CFSTR("%@/%@"), basePath, bundlePath);
+         if (!fullPath) {
+            OSKextLogMemError();
+            goto finish;
+         }
+
+        bundleURL = CFURLCreateWithFileSystemPath(allocator,
+            fullPath, kCFURLPOSIXPathStyle, /* isDir */ true);
+    } else {
+        bundleURL = CFURLCreateWithFileSystemPath(allocator,
+            bundlePath, kCFURLPOSIXPathStyle, /* isDir */ true);
+    }
     if (!bundleURL) {
         OSKextLogMemError();
         goto finish;
     }
-    
+
     __OSKextGetFileSystemPath(/* kext */ NULL, bundleURL,
         /* resolveToBase */ TRUE, kextPath);
 
@@ -2744,6 +3716,30 @@ OSKextRef __OSKextCreateFromIdentifierCacheDict(
         }
     } else {
         newKext->version = kextVersion;
+    }
+
+    bundleType = CFDictionaryGetValue(cacheDict, _kCFBundlePackageTypeKey);
+    if (!bundleType || (CFGetTypeID(bundleType) != CFStringGetTypeID())) {
+        OSKextLog(existingKext,
+            kOSKextLogErrorLevel | kOSKextLogKextBookkeepingFlag,
+            "Can't create kext: missing or non-string bundle package type "
+            "in identifier cache entry %d.",
+            (int)entryIndex);
+        goto finish;
+    }
+    bundleIsDext = CFEqual(bundleType, __kOSKextBundlePackageTypeDriverKit);
+    if (existingKext) {
+        if (OSKextDeclaresUserExecutable(existingKext) !=
+            bundleIsDext) {
+            OSKextLog(existingKext,
+                kOSKextLogErrorLevel | kOSKextLogKextBookkeepingFlag,
+                "Can't create kext from cache: %s is already open and "
+                "has a different CFBundlePackageType "
+                "from identifier->path cache entry %d.",
+                kextPath, (int)entryIndex);
+        }
+    } else {
+        newKext->flags.declaresUserExecutable = bundleIsDext ? 1 : 0;
     }
 
    /* Log flags are stored optionally in the cache.
@@ -3018,7 +4014,7 @@ Boolean __OSKextCheckURL(CFURLRef anURL, Boolean writeCreateFlag)
 
     if (!__OSKextGetFileSystemPath(/* kext */ NULL, anURL,
         /* resolveToBase */ TRUE, path)) {
-        
+
         goto finish;
     }
 
@@ -3029,6 +4025,23 @@ Boolean __OSKextCheckURL(CFURLRef anURL, Boolean writeCreateFlag)
         goto finish;
     }
 
+   /* If we are checking to write a file and possibly create
+    * the containing directory, but the filesystem is read-only,
+    * bail. But only bail if we know for sure it's read-only.
+    */
+    statPath = path;
+    if (writeCreateFlag) {
+        struct statfs  statfsBuffer;
+        if (0 == statfs(statPath, &statfsBuffer)) {
+            if (statfsBuffer.f_flags & MNT_RDONLY) {
+                OSKextLogCFString(/* kext */ NULL,
+                    kOSKextLogProgressLevel | kOSKextLogFileAccessFlag,
+                    CFSTR("Not saving %s - read-only filesystem."), path);
+                goto finish;
+            }
+        }
+    }
+
     slashPtr = &path[0];
     while (1) {
         if (slashPtr == path) {
@@ -3037,22 +4050,6 @@ Boolean __OSKextCheckURL(CFURLRef anURL, Boolean writeCreateFlag)
             statPath = path;
             if (slashPtr) {
                 slashPtr[0] = '\0';
-            }
-        }
-        
-       /* If we are checking to write a file and possibly create
-        * the containing directory, but the filesystem is read-only,
-        * bail. But only bail if we know for sure it's read-only.
-        */
-        if (writeCreateFlag) {
-            struct statfs  statfsBuffer;
-            if (0 == statfs(statPath, &statfsBuffer)) {
-                if (statfsBuffer.f_flags & MNT_RDONLY) {
-                    OSKextLogCFString(/* kext */ NULL,
-                        kOSKextLogProgressLevel | kOSKextLogFileAccessFlag,
-                        CFSTR("Not saving %s - read-only filesystem."), path);
-                    goto finish;
-                }
             }
         }
 
@@ -3827,6 +4824,7 @@ finish:
 void __OSKextRemoveIdentifierCacheForKext(OSKextRef aKext)
 {
     char         scratchPath[PATH_MAX];
+    char         repoPath[PATH_MAX];
     const char * delRoot = NULL;   // do not free
 
    /* We can't do it if we aren't root.
@@ -3843,25 +4841,20 @@ void __OSKextRemoveIdentifierCacheForKext(OSKextRef aKext)
 
    /* I'm sick of CF verbosity so we're going to do this C style.
     */
-    if (!strncmp(scratchPath,
-        _kOSKextSystemLibraryExtensionsFolder,
-        strlen(_kOSKextSystemLibraryExtensionsFolder))) {
-        
-        delRoot = _kOSKextSystemLibraryExtensionsFolder;
 
-    } else if (!strncmp(scratchPath,
-        _kOSKextLibraryExtensionsFolder,
-        strlen(_kOSKextLibraryExtensionsFolder))){
+    CFIndex count = CFArrayGetCount(__sOSKextSystemExtensionsFolderURLs);
+    for (CFIndex i = 0; i < count; i++) {
+        CFURLRef directoryURL = CFArrayGetValueAtIndex(
+            __sOSKextSystemExtensionsFolderURLs, i);
 
-        delRoot = _kOSKextSystemLibraryExtensionsFolder;
+        CFURLGetFileSystemRepresentation(directoryURL, true, (UInt8 *)repoPath, PATH_MAX);
 
-    } else if (!strncmp(scratchPath,
-        _kOSKextAppleInternalLibraryExtensionsFolder,
-        strlen(_kOSKextAppleInternalLibraryExtensionsFolder))){
-
-        delRoot = _kOSKextSystemLibraryExtensionsFolder;
+        if (!strncmp(scratchPath, repoPath, PATH_MAX)) {
+            delRoot = repoPath;
+            break;
+        }
     }
-    
+
     if (!delRoot) {
         goto finish;
     }
@@ -4016,6 +5009,7 @@ CFDictionaryRef __OSKextCreateIdentifierCacheDict(
     CFURLRef               absURL        = NULL;  // must release
     CFStringRef            bundlePath    = NULL;  // must release
     CFStringRef            relativePath  = NULL;  // must release
+    CFStringRef            cachedPath    = NULL;  // do not release
     CFStringRef            scratchString = NULL;  // do not release
     char                   bundlePathCString[PATH_MAX];
     char                   basePathCString[PATH_MAX];
@@ -4046,22 +5040,27 @@ CFDictionaryRef __OSKextCreateIdentifierCacheDict(
             sizeof(basePathCString), kCFStringEncodingUTF8);
             
         OSKextLog(aKext,
-            kOSKextLogErrorLevel | kOSKextLogKextBookkeepingFlag,
-            "%s not in base path %s for identifier->path cache.",
+            kOSKextLogDetailLevel | kOSKextLogKextBookkeepingFlag,
+            "%s not in base path %s for identifier->path cache - marking.",
             bundlePathCString, basePathCString);
+
+        CFDictionarySetValue(preResult, CFSTR("OSBundleUsesAbsolutePath"), kCFBooleanTrue);
+        cachedPath = bundlePath;
+    } else {
+        fullLength = CFStringGetLength(bundlePath);
+        baseLength = 1 + CFStringGetLength(basePath);  // +1 for the final slash
+        relativePath = CFStringCreateWithSubstring(CFGetAllocator(aKext),
+            bundlePath,
+            CFRangeMake(baseLength, fullLength - baseLength));
+        if (!relativePath) {
+            OSKextLogMemError();
+            goto finish;
+        }
+
+        cachedPath = relativePath;
     }
 
-    fullLength = CFStringGetLength(bundlePath);
-    baseLength = 1 + CFStringGetLength(basePath);  // +1 for the final slash
-    relativePath = CFStringCreateWithSubstring(CFGetAllocator(aKext),
-        bundlePath,
-        CFRangeMake(baseLength, fullLength - baseLength));
-    if (!relativePath) {
-        OSKextLogMemError();
-        goto finish;
-    }
-
-    CFDictionarySetValue(preResult, CFSTR("OSBundlePath"), relativePath);
+    CFDictionarySetValue(preResult, CFSTR(kOSBundlePathKey), cachedPath);
 
     scratchString = OSKextGetIdentifier(aKext);
     if (!scratchString) {
@@ -4075,6 +5074,13 @@ CFDictionaryRef __OSKextCreateIdentifierCacheDict(
         goto finish;
     }
     CFDictionarySetValue(preResult, kCFBundleVersionKey, scratchString);
+
+    scratchString = OSKextGetValueForInfoDictionaryKey(aKext,
+                        _kCFBundlePackageTypeKey);
+    if (!scratchString) {
+        goto finish;
+    }
+    CFDictionarySetValue(preResult, _kCFBundlePackageTypeKey, scratchString);
 
    /* Only save nonzero log flags, to save file space.
     */
@@ -4241,6 +5247,7 @@ OSKextRef OSKextGetKextWithURL(
     CFURLRef    canonicalURL  = NULL;  // must release
     char        relPath[PATH_MAX];
     char        absPath[PATH_MAX];
+    char        realPath[PATH_MAX];
 
     pthread_once(&__sOSKextInitialized, __OSKextInitialize);
 
@@ -4254,10 +5261,18 @@ OSKextRef OSKextGetKextWithURL(
         goto finish;
     }
 
+    if (!realpath(absPath, realPath)) {
+        OSKextLog(/* kext */ NULL,
+            kOSKextLogErrorLevel | kOSKextLogFileAccessFlag,
+            "Unable to determine realpath for %s - failing.",
+            absPath);
+        goto finish;
+    }
+
    /* Canonicalize the URL so we can use it for a dictionary lookup.
     */
     canonicalURL = CFURLCreateFromFileSystemRepresentation(CFGetAllocator(anURL),
-        (uint8_t *)absPath, strlen(absPath), /* isDir */ true);
+        (uint8_t *)realPath, strlen(realPath), /* isDir */ true);
     if (!canonicalURL) {
         OSKextLogMemError();
         goto finish;
@@ -4423,9 +5438,6 @@ finish:
     return result;
 }
 
-/*********************************************************************
-XXX - Should this check valid/authentic flags and skip failed kexts?
-*********************************************************************/
 OSKextRef OSKextGetCompatibleKextWithIdentifier(
     CFStringRef   aBundleID,
     OSKextVersion requestedVersion)
@@ -4453,7 +5465,18 @@ OSKextRef OSKextGetCompatibleKextWithIdentifier(
         OSKextRef theKext = (OSKextRef)foundEntry;
 
         if (OSKextIsCompatibleWithVersion(theKext, requestedVersion)) {
-            result = theKext;
+            if (__sOSKextStrictAuthentication) {
+                if (OSKextIsValid(theKext) && OSKextIsAuthentic(theKext)) {
+                    result = theKext;
+                } else {
+                    OSKextLogCFString(/* kext */ NULL,
+                                      kOSKextLogErrorLevel | kOSKextLogValidationFlag,
+                                      CFSTR("Rejecting invalid/inauthentic kext for bundle id %@ at location %@."),
+                                      aBundleID, OSKextGetURL(theKext));
+                }
+            } else {
+                result = theKext;
+            }
         }
 
     } else if (CFArrayGetTypeID() == CFGetTypeID(foundEntry)) {
@@ -4463,9 +5486,22 @@ OSKextRef OSKextGetCompatibleKextWithIdentifier(
         count = CFArrayGetCount(kexts);
         for (i = 0; i < count; i++) {
             OSKextRef thisKext = (OSKextRef)CFArrayGetValueAtIndex(kexts, i);
+
             if (OSKextIsCompatibleWithVersion(thisKext, requestedVersion)) {
-                result = thisKext;
-                goto finish;
+                if (__sOSKextStrictAuthentication) {
+                    if (OSKextIsValid(thisKext) && OSKextIsAuthentic(thisKext)) {
+                        result = thisKext;
+                        goto finish;
+                    } else {
+                        OSKextLogCFString(/* kext */ NULL,
+                            kOSKextLogErrorLevel | kOSKextLogValidationFlag,
+                            CFSTR("Rejecting invalid/inauthentic kext for bundle id %@ at location %@."),
+                            aBundleID, OSKextGetURL(thisKext));
+                    }
+                } else {
+                    result = thisKext;
+                    goto finish;
+                }
             }
         }
     }
@@ -4823,6 +5859,14 @@ CFStringRef OSKextGetIdentifier(OSKextRef aKext)
 
 /*********************************************************************
 *********************************************************************/
+bool _OSKextIdentifierHasApplePrefix(OSKextRef aKext)
+{
+    CFStringRef bundleID = OSKextGetIdentifier(aKext);
+    return CFStringHasPrefix(bundleID, __kOSKextApplePrefix);
+}
+
+/*********************************************************************
+*********************************************************************/
 #define COMPOSITE_KEY_SEPARATOR  "_"
 
 CFStringRef __OSKextCreateCompositeKey(
@@ -4951,17 +5995,22 @@ void OSKextFlushInfoDictionary(OSKextRef aKext)
         if (!OSKextIsFromMkext(aKext)) {
             SAFE_RELEASE_NULL(aKext->infoDictionary);
 
-           /* The info dict could change by the time we read it again,
-            * so clear all validation/authentication flags. Leave
-            * diagnostics in place (a bit funky I suppose).
-            */
-            aKext->flags.valid = 0;
-            aKext->flags.invalid = 0;
-            aKext->flags.validated = 0;
-            aKext->flags.authentic = 0;
-            aKext->flags.inauthentic = 0;
-            aKext->flags.authenticated = 0;
-            aKext->flags.isSigned = 0;
+            // Flush cached auth bits for non-Apple (or invalid or inauthentic) kexts only
+            if (!aKext->flags.rootless_trusted ||
+                !aKext->flags.valid ||
+                !aKext->flags.authentic) {
+               /* The info dict could change by the time we read it again,
+                * so clear all validation/authentication flags. Leave
+                * diagnostics in place (a bit funky I suppose).
+                */
+                aKext->flags.valid = 0;
+                aKext->flags.invalid = 0;
+                aKext->flags.validated = 0;
+                aKext->flags.authentic = 0;
+                aKext->flags.inauthentic = 0;
+                aKext->flags.authenticated = 0;
+                aKext->flags.isSigned = 0;
+            }
         }
 
     } else if (__sOSKextsByURL) {
@@ -5063,16 +6112,15 @@ CFDataRef OSKextCopyUUIDForArchitecture(
 
 finish:
 
-   /* Advise the system that we no longer need the mmapped executable.
-    */
-    if (executable) {
-        (void)posix_madvise((void *)CFDataGetBytePtr(executable),
-            CFDataGetLength(executable),
-            POSIX_MADV_DONTNEED);
-    }
-
     SAFE_RELEASE(executable);
     return result;
+}
+
+/*********************************************************************
+*********************************************************************/
+Boolean OSKextDeclaresUserExecutable(OSKextRef aKext)
+{
+    return aKext->flags.declaresUserExecutable ? true : false;
 }
 
 /*********************************************************************
@@ -5080,7 +6128,6 @@ finish:
 Boolean  OSKextIsKernelComponent(OSKextRef aKext)
 {
     return aKext->flags.isKernelComponent ? true : false;
-
 }
 
 /*********************************************************************
@@ -5101,7 +6148,7 @@ Boolean  OSKextIsLibrary(OSKextRef aKext)
 *********************************************************************/
 Boolean  OSKextDeclaresExecutable(OSKextRef aKext)
 {
-    return aKext->flags.declaresExecutable ? true : false;
+    return aKext->flags.declaresKernelExecutable ? true : false;
 }
 
 /*********************************************************************
@@ -5210,7 +6257,7 @@ const NXArchInfo ** OSKextCopyArchitectures(OSKextRef aKext)
 
     if (!fatIterator) {
         __OSKextGetFileSystemPath(aKext,
-        /* otherURL */ _CFBundleCopyExecutableURLInDirectory(OSKextGetURL(aKext)),
+        /* otherURL */ OSKextGetKernelExecutableURL(aKext),
         /* resolveToBase */ false, urlPath);
 
         OSKextLog(aKext,
@@ -5241,12 +6288,6 @@ const NXArchInfo ** OSKextCopyArchitectures(OSKextRef aKext)
     }
 
 finish:
-   /* Advise the system that we no longer need the mmapped executable.
-    */
-    if (executable) {
-        (void)posix_madvise((void *)executable, executableEnd - executable,
-            POSIX_MADV_DONTNEED);
-    }
     if (fatIterator) {
         fat_iterator_close(fatIterator);
     }
@@ -5308,14 +6349,6 @@ Boolean OSKextSupportsArchitecture(OSKextRef aKext,
     result = true;
 
 finish:
-   /* Advise the system that we no longer need the mmapped executable.
-    */
-    if (executable) {
-        (void)posix_madvise((void *)CFDataGetBytePtr(executable),
-            CFDataGetLength(executable),
-            POSIX_MADV_DONTNEED);
-    }
-
     SAFE_RELEASE(executable);
     if (fatIterator) fat_iterator_close(fatIterator);
     return result;
@@ -5330,9 +6363,10 @@ CFArrayRef OSKextCopyPlugins(OSKextRef aKext)
     CFURLRef    pluginsURL = NULL;  // must release
     CFArrayRef  pluginURLs = NULL;   // must release
 
-   /* If aKext is a plugin, don't scan, and return an empty array.
+   /* If aKext is a plugin or a DriverKit extension, don't scan,
+    * and return an empty array.
     */
-    if (OSKextIsPlugin(aKext)) {
+    if (OSKextIsPlugin(aKext) || OSKextDeclaresUserExecutable(aKext)) {
         result = CFArrayCreate(CFGetAllocator(aKext), NULL, 0,
             &kCFTypeArrayCallBacks);
         goto finish;
@@ -5402,7 +6436,7 @@ Boolean OSKextIsPlugin(OSKextRef aKext)
     if (!parentPath) {
         OSKextLogMemError();
     }
-    findRange = CFStringFind(parentPath, CFSTR(__sOSKextFullBundleExtension),
+    findRange = CFStringFind(parentPath, CFSTR(__sOSKextBundleExtension),
         /* compareOptions */ 0);
 
     aKext->staticFlags.isPlugin = (findRange.location == kCFNotFound) ? 0 : 1;
@@ -5458,7 +6492,7 @@ OSKextRef OSKextCopyContainerForPluginKext(OSKextRef aKext)
         OSKextLogMemError();
         goto finish;
     }
-    findRange = CFStringFind(parentPath, CFSTR(__sOSKextFullBundleExtension),
+    findRange = CFStringFind(parentPath, CFSTR(__sOSKextBundleExtension),
         kCFCompareBackwards);
 
     aKext->staticFlags.isPlugin = (findRange.location == kCFNotFound) ? 0 : 1;
@@ -5551,32 +6585,54 @@ finish:
     return result;
 }
 
-
 /*********************************************************************
 *********************************************************************/
 typedef struct {
-    OSKextRef         kext;
-    CFMutableArrayRef personalities;
-} __OSKextPersonalityBundleIdentifierContext;
+    OSKextRef              kext;
+    CFMutableArrayRef      personalitiesArray;
+    CFMutableDictionaryRef personalitiesDict;
+    CFArrayRef             personalityNames;
+    bool                   includeBundleIDs;
+} __OSKextPersonalityPatcherContext;
 
-static void __OSKextPersonalityBundleIdentifierApplierFunction(
+static void __OSKextPersonalityPatcherApplierFunction(
     const void * vKey,
     const void * vValue,
           void * vContext)
 {
     CFStringRef            personalityName     = (CFStringRef)vKey;
     CFMutableDictionaryRef personality         = (CFMutableDictionaryRef)vValue;
-    __OSKextPersonalityBundleIdentifierContext  * context =
-        (__OSKextPersonalityBundleIdentifierContext *)vContext;
+    __OSKextPersonalityPatcherContext  * context =
+        (__OSKextPersonalityPatcherContext *)vContext;
     OSKextRef              aKext               = context->kext;
-    CFMutableArrayRef      personalities       = context->personalities;
+    CFMutableArrayRef      personalitiesArray  = context->personalitiesArray;
+    CFMutableDictionaryRef personalitiesDict   = context->personalitiesDict;
+    CFArrayRef             personalityNames    = context->personalityNames;
     CFStringRef            bundleID            = NULL;  // do not release
+    bool                   includeBundleIDs    = context->includeBundleIDs;
 
     CFMutableDictionaryRef personalityCopy     = NULL;  // must release
     CFStringRef            personalityBundleID = NULL;  // do not release
     char                   kextPath[PATH_MAX];
     char                 * bundleIDCString     = NULL;  // must free
     char                 * personalityCString  = NULL;  // must free
+
+    // Make sure that each personality is a dict of dicts
+    if (CFGetTypeID(personality) != CFDictionaryGetTypeID()) {
+        OSKextLog(/* kext */ NULL,
+            kOSKextLogErrorLevel | kOSKextLogKextBookkeepingFlag,
+            "Kext personality %s subentry is not a dictionary",
+            CFStringGetCStringPtr(personalityName, kCFStringEncodingUTF8));
+        goto finish;
+    }
+
+    /* If caller specifies a filter of names, ignore unwanted personalities */
+    if (personalityNames && CFGetTypeID(personalityNames) == CFArrayGetTypeID()) {
+        CFRange range = CFRangeMake(0, CFArrayGetCount(personalityNames));
+        if (!CFArrayContainsValue(personalityNames, range, personalityName)) {
+            goto finish;
+        }
+    }
 
     bundleID = OSKextGetIdentifier(aKext);
     if (!bundleID) {
@@ -5593,41 +6649,55 @@ static void __OSKextPersonalityBundleIdentifierApplierFunction(
         goto finish;
     }
 
-   /* If the personality has no bundle identifier, insert that of the
-    * containing bundle. If is has one but it's not the same as the
-    * containing bundle's, insert that as the personality publisher.
-    */
-    personalityBundleID = CFDictionaryGetValue(personality,
-        kCFBundleIdentifierKey);
-    if (!personalityBundleID) {
-        CFDictionarySetValue(personalityCopy, kCFBundleIdentifierKey, bundleID);
-    } else if (!CFEqual(bundleID, personalityBundleID)) {
-        CFDictionarySetValue(personalityCopy, CFSTR(kIOPersonalityPublisherKey),
-            bundleID);
-    }
-
-   /* Spare the effort of creating the data when not logging by checking
-    * before the OSKextLog() call.
-    */
-    if (__OSKextShouldLog(aKext, kOSKextLogDetailLevel | kOSKextLogLoadFlag)) {
-        __OSKextGetFileSystemPath(aKext, /* otherURL */ NULL,
-            /* resolveToBase */ false, kextPath);
-        bundleIDCString = createUTF8CStringForCFString(bundleID);
-        personalityCString = createUTF8CStringForCFString(personalityName);
+    if (includeBundleIDs) {
+       /* If the personality has no bundle identifier, insert that of the
+        * containing bundle. If is has one but it's not the same as the
+        * containing bundle's, insert that as the personality publisher.
+        */
+        personalityBundleID = CFDictionaryGetValue(personality,
+            kCFBundleIdentifierKey);
         if (!personalityBundleID) {
-            OSKextLog(aKext,
-                kOSKextLogDetailLevel | kOSKextLogLoadFlag,
-                "Adding CFBundleIdentifier %s to %s personality %s.",
-                bundleIDCString, kextPath, personalityCString);
+            CFDictionarySetValue(personalityCopy, kCFBundleIdentifierKey, bundleID);
         } else if (!CFEqual(bundleID, personalityBundleID)) {
-            OSKextLog(aKext,
-                kOSKextLogDetailLevel | kOSKextLogLoadFlag,
-                "Adding IOBundlePublisher %s to %s personality %s.",
-                bundleIDCString, kextPath, personalityCString);
+            CFDictionarySetValue(personalityCopy, CFSTR(kIOPersonalityPublisherKey),
+                bundleID);
         }
+
+        /* Spare the effort of creating the data when not logging by checking
+        * before the OSKextLog() call.
+        */
+        if (__OSKextShouldLog(aKext, kOSKextLogDetailLevel | kOSKextLogLoadFlag)) {
+            __OSKextGetFileSystemPath(aKext, /* otherURL */ NULL,
+                /* resolveToBase */ false, kextPath);
+            bundleIDCString = createUTF8CStringForCFString(bundleID);
+            personalityCString = createUTF8CStringForCFString(personalityName);
+            if (!personalityBundleID) {
+                OSKextLog(aKext,
+                    kOSKextLogDetailLevel | kOSKextLogLoadFlag,
+                    "Adding CFBundleIdentifier %s to %s personality %s.",
+                    bundleIDCString, kextPath, personalityCString);
+            } else if (!CFEqual(bundleID, personalityBundleID)) {
+                OSKextLog(aKext,
+                    kOSKextLogDetailLevel | kOSKextLogLoadFlag,
+                    "Adding IOBundlePublisher %s to %s personality %s.",
+                    bundleIDCString, kextPath, personalityCString);
+            }
+        }
+
     }
 
-    CFArrayAppendValue(personalities, personalityCopy);
+    /* If set, patch the personality with the function provided by the client. */
+    if (__sOSKextPersonalityPatcherFunction &&
+       !__sOSKextPersonalityPatcherFunction(aKext, personalityCopy)) {
+        goto finish;
+    }
+
+    if (personalitiesArray) {
+        CFArrayAppendValue(personalitiesArray, personalityCopy);
+    }
+    if (personalitiesDict) {
+        CFDictionarySetValue(personalitiesDict, personalityName, personalityCopy);
+    }
 
 finish:
     SAFE_FREE(bundleIDCString);
@@ -5642,7 +6712,7 @@ CFArrayRef OSKextCopyPersonalitiesArray(OSKextRef aKext)
 {
     CFMutableArrayRef        result            = NULL;
     CFDictionaryRef          personalities     = NULL; // do not release
-    __OSKextPersonalityBundleIdentifierContext context;
+    __OSKextPersonalityPatcherContext context;
 
     result = CFArrayCreateMutable(CFGetAllocator(aKext), 0,
         &kCFTypeArrayCallBacks);
@@ -5653,14 +6723,27 @@ CFArrayRef OSKextCopyPersonalitiesArray(OSKextRef aKext)
 
     personalities = OSKextGetValueForInfoDictionaryKey(aKext,
         CFSTR(kIOKitPersonalitiesKey));
-    if (!personalities || !CFDictionaryGetCount(personalities)) {
+
+    if (!personalities) {
+        goto finish;
+    } else if (CFGetTypeID(personalities) != CFDictionaryGetTypeID()) {
+        OSKextLog(/* kext */ NULL,
+            kOSKextLogErrorLevel | kOSKextLogKextBookkeepingFlag,
+            "Kext personality for kext %s is not a dictionary",
+            CFStringGetCStringPtr(CFURLGetString(aKext->bundleURL), kCFStringEncodingUTF8));
+        goto finish;
+    } else if (!CFDictionaryGetCount(personalities)) {
         goto finish;
     }
 
-    context.kext = aKext;
-    context.personalities = result;
+    context.kext               = aKext;
+    context.personalitiesArray = result;
+    context.personalitiesDict  = NULL; /* We want an array, not a dict */
+    context.personalityNames   = NULL; /* Don't filter names */
+    context.includeBundleIDs   = true;
+
     CFDictionaryApplyFunction(personalities,
-        __OSKextPersonalityBundleIdentifierApplierFunction,
+        __OSKextPersonalityPatcherApplierFunction,
         &context);
 
 finish:
@@ -5673,7 +6756,7 @@ CFArrayRef OSKextCopyPersonalitiesOfKexts(CFArrayRef kextArray)
 {
     CFMutableArrayRef result              = NULL;
     CFDictionaryRef   kextPersonalities   = NULL; // do not release
-    __OSKextPersonalityBundleIdentifierContext context;
+    __OSKextPersonalityPatcherContext context;
     CFIndex           count, i;
 
     if (!kextArray) {
@@ -5688,7 +6771,7 @@ CFArrayRef OSKextCopyPersonalitiesOfKexts(CFArrayRef kextArray)
         goto finish;
     }
 
-    context.personalities = result;
+    context.personalitiesArray = result;
 
     count = CFArrayGetCount(kextArray);
     for (i = 0; i < count; i++) {
@@ -5696,12 +6779,31 @@ CFArrayRef OSKextCopyPersonalitiesOfKexts(CFArrayRef kextArray)
 
         kextPersonalities = OSKextGetValueForInfoDictionaryKey(thisKext,
             CFSTR(kIOKitPersonalitiesKey));
-        if (!kextPersonalities || !CFDictionaryGetCount(kextPersonalities)) {
+
+        // This is gross, but we can't safely get the type of the pointer without
+        // checking first if it's NULL, and we can't get the count of the elements
+        // unless we're sure it's a dictionary (and if it isn't, we should probably
+        // log it.)
+        if (!kextPersonalities) {
+            continue;
+        } else if (CFGetTypeID(kextPersonalities) != CFDictionaryGetTypeID()) {
+            OSKextLog(/* kext */ NULL,
+                kOSKextLogErrorLevel | kOSKextLogKextBookkeepingFlag,
+                "Kext personality for kext %s is not a dictionary",
+                CFStringGetCStringPtr(CFURLGetString(thisKext->bundleURL), kCFStringEncodingUTF8));
+            continue;
+        } else if (!CFDictionaryGetCount(kextPersonalities)) {
             continue;
         }
-        context.kext = thisKext;
+
+        context.kext               = thisKext;
+        context.personalitiesArray = result;
+        context.personalitiesDict  = NULL; /* We want an array, not a dict */
+        context.personalityNames   = NULL; /* Don't filter names */
+        context.includeBundleIDs   = true;
+
         CFDictionaryApplyFunction(kextPersonalities,
-            __OSKextPersonalityBundleIdentifierApplierFunction,
+            __OSKextPersonalityPatcherApplierFunction,
             &context);
     }
 
@@ -5738,7 +6840,7 @@ CFDataRef __OSKextMapExecutable(
 {
     CFDataRef                result                     = NULL;
     int                      localErrno                 = 0;
-    char                     kextPath[PATH_MAX];
+    CFURLRef                 executableURL              = NULL;  // do not release
     CFStringRef              executableName             = NULL;  // do not release
     char                     executablePath[PATH_MAX];
     struct stat              executableStat;
@@ -5748,76 +6850,20 @@ CFDataRef __OSKextMapExecutable(
     CFAllocatorContext       mmapAllocatorContext;
     CFAllocatorRef           mmapAllocator              = NULL;  // must release
 
-    __OSKextGetFileSystemPath(aKext, /* otherURL */ NULL,
-        /* resolveToBase */ true, kextPath);
 
     if (!__OSKextCreateLoadInfo(aKext)) {
         goto finish;
     }
 
-    if (!aKext->loadInfo->executableURL) {
-        // xxx - this bit might warrant a kOSKextLogFileAccessFlag message
-        OSKextLog(aKext,
-            kOSKextLogDebugLevel | kOSKextLogFileAccessFlag,
-            "Checking CFBundle of %s for executable URL.",
-            kextPath);
-        aKext->loadInfo->executableURL =
-            _CFBundleCopyExecutableURLInDirectory(OSKextGetURL(aKext));
-    }
-
-   /* Did we fail to get an executable URL, even though the kext has a
-    * CFBundleExecutable? Tag the kext with a diagnostic.
-    */
-    if (!aKext->loadInfo->executableURL) {
-        executableName = OSKextGetValueForInfoDictionaryKey(aKext,
-            kCFBundleExecutableKey);
-            
-        if (executableName) {
-            __OSKextAddDiagnostic(aKext,
-                kOSKextDiagnosticsFlagValidation,
-                kOSKextDiagnosticExecutableMissingKey,
-                executableName, /* note */ NULL);
-            goto finish;
-        }
-    }
-
-#if SHARED_EXECUTABLE
-   /* No executable URL? Check for a shared executable and nab
-    * a copy direct from the owning kext.
-    */
-    if (!aKext->loadInfo->executableURL) {
-        CFStringRef sharedExecutableIdentifier = NULL;  // do not release
-        sharedExecutableIdentifier = OSKextGetValueForInfoDictionaryKey(
-            aKext, CFSTR(kOSBundleSharedExecutableIdentifierKey));
-        if (sharedExecutableIdentifier) {
-
-            // xxx - does not handle multiple versions/duplicates!
-            OSKextRef sharedExecutableKext =
-                OSKextGetKextWithIdentifier(sharedExecutableIdentifier);
-            if (sharedExecutableKext) {
-                aKext->loadInfo->executableURL =
-                    _CFBundleCopyExecutableURLInDirectory(
-                        OSKextGetURL(sharedExecutableKext));
-            } else {
-                __OSKextAddDiagnostic(aKext,
-                    kOSKextDiagnosticsFlagValidation,
-                    kOSKextDiagnosticSharedExecutableKextMissingKey,
-                    sharedExecutableIdentifier, /* note */ NULL);
-                goto finish;
-            }
-        }
-    }
-#endif
+    executableURL = OSKextGetKernelExecutableURL(aKext);
 
    /* We have no way of distinguishing whether the kext has no
     * CFBundleExecutable vs. whether the call above failed, so
     * just process when we do get an URL.
     */
-    if (aKext->loadInfo->executableURL) {
+    if (executableURL) {
         if (!__OSKextGetFileSystemPath(/* kext */ NULL,
-            aKext->loadInfo->executableURL,
-            /* resolveToBase */ true, executablePath)) {
-
+            executableURL, /* resolveToBase */ true, executablePath)) {
             goto finish;
         }
 
@@ -5834,12 +6880,12 @@ CFDataRef __OSKextMapExecutable(
                     executableName, /* note */ NULL);
                 __OSKextAddDiagnostic(aKext, kOSKextDiagnosticsFlagValidation,
                     kOSKextDiagnosticFileNotFoundKey,
-                    aKext->loadInfo->executableURL, /* note */ NULL);
+                    aKext->executableURL, /* note */ NULL);
 
             } else {
                 __OSKextAddDiagnostic(aKext, kOSKextDiagnosticsFlagValidation,
                     kOSKextDiagnosticStatFailureKey,
-                    aKext->loadInfo->executableURL, /* note */ NULL);
+                    aKext->executableURL, /* note */ NULL);
             }
             OSKextLog(aKext,
                 kOSKextLogErrorLevel | kOSKextLogFileAccessFlag,
@@ -5870,11 +6916,11 @@ CFDataRef __OSKextMapExecutable(
                     /* note */ NULL);
                 __OSKextAddDiagnostic(aKext, kOSKextDiagnosticsFlagValidation,
                     kOSKextDiagnosticFileNotFoundKey,
-                    aKext->loadInfo->executableURL, /* note */ NULL);
+                    aKext->executableURL, /* note */ NULL);
             } else {
                 __OSKextAddDiagnostic(aKext, kOSKextDiagnosticsFlagValidation,
                     kOSKextDiagnosticFileAccessKey,
-                    aKext->loadInfo->executableURL, /* note */ NULL);
+                    aKext->executableURL, /* note */ NULL);
             }
             OSKextLog(aKext,
                 kOSKextLogErrorLevel | kOSKextLogFileAccessFlag,
@@ -5889,7 +6935,7 @@ CFDataRef __OSKextMapExecutable(
         */
         executableBuffer = mmap(/* addr */ NULL, length,
             PROT_READ|PROT_WRITE, MAP_FILE|MAP_PRIVATE, executableFD, offset);
-        if (!executableBuffer) {
+        if (executableBuffer == MAP_FAILED) {
             localErrno = errno;
             
            /* Only if we are mapping the executable as a whole, flag its
@@ -5899,7 +6945,7 @@ CFDataRef __OSKextMapExecutable(
             */
             if (length == 0) {
                 __OSKextAddDiagnostic(aKext, kOSKextDiagnosticsFlagValidation,
-                    kOSKextDiagnosticFileAccessKey, aKext->loadInfo->executableURL,
+                    kOSKextDiagnosticFileAccessKey, aKext->executableURL,
                     /* note */ NULL);
                 __OSKextAddDiagnostic(aKext, kOSKextDiagnosticsFlagValidation,
                     kOSKextDiagnosticExecutableMissingKey, executableName,
@@ -6025,16 +7071,6 @@ Boolean __OSKextReadExecutable(OSKextRef aKext)
     result = true;
 
 finish:
-   /* Most access to a Mach-O executable is going to be random, so advise
-    * the system about that.
-    */
-    if (aKext->loadInfo && aKext->loadInfo->executable) {
-        (void)posix_madvise(
-            (void *)CFDataGetBytePtr(aKext->loadInfo->executable),
-            CFDataGetLength(aKext->loadInfo->executable),
-            POSIX_MADV_RANDOM);
-    }
-
     return result;
 }
 
@@ -6690,6 +7726,27 @@ Boolean __OSKextHasAllDependencies(OSKextRef aKext)
     return false;
 }
 
+static Boolean __OSKextHasSuffix(OSKextRef aKext, const char *suffix)
+{
+    char path[PATH_MAX];
+
+    CFURLRef executableURL = OSKextGetKernelExecutableURL(aKext);
+    if (!executableURL) {
+        return false;
+    }
+
+    if (__OSKextGetFileSystemPath(NULL, executableURL, true, path)) {
+        const size_t plen = strlen(path);
+        const size_t slen = strlen(suffix);
+
+        if ((plen > slen) && !strncmp(suffix, &path[plen - slen], slen)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 /*********************************************************************
 *********************************************************************/
 // return should be OSReturn
@@ -6997,6 +8054,18 @@ Boolean __OSKextResolveDependencies(
         }
     }
 
+    /*
+     * If this is a KASan kext, implicitly link against the KASan bundle.
+     */
+    if (OSKextDeclaresExecutable(aKext) && __OSKextHasSuffix(aKext, "_kasan")) {
+        OSKextRef kasan_kext = OSKextGetKextWithIdentifier(__kOSKextKasanKPI);
+        if (kasan_kext) {
+            OSKextLog(aKext, kOSKextLogDetailLevel | kOSKextLogDependenciesFlag,
+                    "%s adding implicit KASan dependency", kextPath);
+            CFArrayAppendValue(aKext->loadInfo->dependencies, kasan_kext);
+        }
+    }
+
     /* On 64-bit, we require that a kext explicitly list its dependencies
      * through KPIs only. This means that while it is not an error not to link
      * against any kernel components, we also won't implicitly link the kext
@@ -7067,11 +8136,8 @@ Boolean __OSKextResolveDependencies(
     {
         CFStringRef     infoString                  = NULL;  // do not release
         CFStringRef     readableString              = NULL;  // do not release
-        Boolean         hasApplePrefix              = false;
         Boolean         infoCopyrightIsValid        = false;
         Boolean         readableCopyrightIsValid    = false;
-
-        hasApplePrefix = CFStringHasPrefix(aKext->bundleID, __kOSKextApplePrefix);
 
         infoString = (CFStringRef) OSKextGetValueForInfoDictionaryKey(aKext,
             CFSTR("CFBundleGetInfoString"));
@@ -7090,7 +8156,8 @@ Boolean __OSKextResolveDependencies(
             SAFE_FREE(readableCString);
         }
 
-        if (!hasApplePrefix || (!infoCopyrightIsValid && !readableCopyrightIsValid)) {
+        if (!_OSKextIdentifierHasApplePrefix(aKext) ||
+            (!infoCopyrightIsValid && !readableCopyrightIsValid)) {
 
             OSKextLog(aKext, kOSKextLogErrorLevel | kOSKextLogDependenciesFlag,
                 "%s has an Apple prefix but no copyright.", kextPath);
@@ -7191,10 +8258,10 @@ Boolean OSKextResolveDependencies(OSKextRef aKext)
         * root kext being resolved, it's probably too expensive to do for all.
         */
         if (result) {
-            CFStringRef required                   = NULL;  // do not release
-            Boolean     checkRootOrConsoleRequired = FALSE;
-            Boolean     checkLocalRequired         = FALSE;
-            Boolean     checkNetworkRequired       = FALSE;
+            CFStringRef required                       = NULL;  // do not release
+            Boolean     checkRootOrConsoleOrDKRequired = FALSE;
+            Boolean     checkLocalRequired             = FALSE;
+            Boolean     checkNetworkRequired           = FALSE;
 
             loadList = OSKextCopyLoadList(aKext, /* needAll */ true);
             if (!loadList) {
@@ -7209,9 +8276,10 @@ Boolean OSKextResolveDependencies(OSKextRef aKext)
             required = OSKextGetValueForInfoDictionaryKey(aKext, CFSTR(kOSBundleRequiredKey));
             if (required) {
                 if (CFEqual(required, CFSTR(kOSBundleRequiredRoot)) ||
-                    CFEqual(required, CFSTR(kOSBundleRequiredConsole))) {
-                    
-                    checkRootOrConsoleRequired = TRUE;
+                    CFEqual(required, CFSTR(kOSBundleRequiredConsole)) ||
+                    CFEqual(required, CFSTR(kOSBundleRequiredDriverKit))) {
+
+                    checkRootOrConsoleOrDKRequired = TRUE;
                 } else if (CFEqual(required, CFSTR(kOSBundleRequiredLocalRoot))) {
                     checkLocalRequired = TRUE;
                 } else if (CFEqual(required, CFSTR(kOSBundleRequiredNetworkRoot))) {
@@ -7232,10 +8300,10 @@ Boolean OSKextResolveDependencies(OSKextRef aKext)
                 * Safe Boot. We can assume the kext is valid here and therefore
                 * that its OSBundleRequired is a required value.
                 */
-                if (checkRootOrConsoleRequired) {
+                if (checkRootOrConsoleOrDKRequired) {
                     if (!thisRequired ||
                         CFEqual(CFSTR(kOSBundleRequiredSafeBoot), thisRequired)) {
-                        
+
                             __OSKextAddDiagnostic(aKext,
                                 kOSKextDiagnosticsFlagWarnings,
                                 kOSKextDiagnosticsDependencyNotOSBundleRequired,
@@ -7248,8 +8316,9 @@ Boolean OSKextResolveDependencies(OSKextRef aKext)
                     if (!thisRequired ||
                         !(CFEqual(CFSTR(kOSBundleRequiredRoot), thisRequired) ||
                           CFEqual(CFSTR(kOSBundleRequiredLocalRoot), thisRequired) ||
-                          CFEqual(CFSTR(kOSBundleRequiredConsole), thisRequired))) {
-                        
+                          CFEqual(CFSTR(kOSBundleRequiredConsole), thisRequired)) ||
+                          CFEqual(CFSTR(kOSBundleRequiredDriverKit), thisRequired)) {
+
                             __OSKextAddDiagnostic(aKext,
                                 kOSKextDiagnosticsFlagWarnings,
                                 kOSKextDiagnosticsDependencyNotOSBundleRequired,
@@ -7262,8 +8331,9 @@ Boolean OSKextResolveDependencies(OSKextRef aKext)
                     if (!thisRequired ||
                         !(CFEqual(CFSTR(kOSBundleRequiredRoot), thisRequired) ||
                          CFEqual(CFSTR(kOSBundleRequiredNetworkRoot), thisRequired) ||
-                         CFEqual(CFSTR(kOSBundleRequiredConsole), thisRequired))) {
-                        
+                         CFEqual(CFSTR(kOSBundleRequiredConsole), thisRequired)) ||
+                         CFEqual(CFSTR(kOSBundleRequiredDriverKit), thisRequired)) {
+
                             __OSKextAddDiagnostic(aKext,
                                 kOSKextDiagnosticsFlagWarnings,
                                 kOSKextDiagnosticsDependencyNotOSBundleRequired,
@@ -7767,14 +8837,6 @@ Boolean __OSKextReadSymbolReferences(
     result = true;
 finish:
 
-   /* Advise the system that we no longer need the mmapped executable.
-    */
-    if (executable) {
-        (void)posix_madvise((void *)CFDataGetBytePtr(executable),
-            CFDataGetLength(executable),
-            POSIX_MADV_DONTNEED);
-    }
-
     SAFE_RELEASE(executable);
     return result;
 }
@@ -8029,11 +9091,6 @@ finish:
 
    /* Advise the system that we no longer need the mmapped executable.
     */
-    if (executable) {
-        (void)posix_madvise((void *)CFDataGetBytePtr(executable),
-            CFDataGetLength(executable),
-            POSIX_MADV_DONTNEED);
-    }
     SAFE_RELEASE(cfSymbolName);
     SAFE_RELEASE(executable);
     return result;
@@ -8823,6 +9880,13 @@ OSReturn __OSKextLoadWithArgsDict(
         goto finish;
     }
 
+    if (!__sOSKextLoadAuditFunction) {
+        OSKextLog(aKext, kOSKextLogErrorLevel | kOSKextLogLoadFlag,
+             "No load audit function set, cannot load %s", kextPath);
+        result = kOSReturnError;
+        goto finish;
+    }
+
    /* First resolve dependencies without loaded kext info to build
     * a list of identifiers, so we don't read any more bundles off
     * disk than necessary when we do check loaded. If we have different
@@ -8922,7 +9986,7 @@ OSReturn __OSKextLoadWithArgsDict(
             goto finish;
         }
     }
-    
+
    /* Ok, now resolve dependencies based on kexts having their load info.
     * Hopefully it'll still work.
     */
@@ -8942,6 +10006,17 @@ OSReturn __OSKextLoadWithArgsDict(
         goto finish;
     }
 
+    /*
+     * The auditing function is called for every kext in
+     * loadList from __OSKextCreateMkext.
+     *
+     * At this point loadList includes aKext too because
+     * OSKextCopyLoadList includes it by default.
+     *
+     * If for any reason this assumption changes, an
+     * explicit call to __sOSKextLoadAuditFunction must be
+     * forced for aKext before calling __OSKextCreateMkext.
+     */
     // construct mkext w/o compression & w/o loaded kexts in it
     mkext = __OSKextCreateMkext(CFGetAllocator(aKext), loadList,
         /* volumeRootURL */ NULL,
@@ -9097,79 +10172,78 @@ finish:
 }
 
 #ifndef IOKIT_EMBEDDED
+
+
 /*********************************************************************
-*********************************************************************/
+ *********************************************************************/
 Boolean __OSKextInitKXLDDependency(
-    KXLDDependency * dependency,
-    OSKextRef        aKext,
-    CFDataRef        kernelImage,
-    Boolean          isDirect)
+                                   KXLDDependency * dependency,
+                                   OSKextRef        aKext,
+                                   CFDataRef        kernelImage,
+                                   Boolean          isDirect)
 {
     Boolean result = FALSE;
     char    kextPath[PATH_MAX];
     
     if (!aKext->loadInfo->linkedExecutable) {
         __OSKextGetFileSystemPath(aKext,
-            /* otherURL */ NULL,
-            /* resolveToBase */ false, kextPath);
+                                  /* otherURL */ NULL,
+                                  /* resolveToBase */ false, kextPath);
         OSKextLog(aKext, kOSKextLogErrorLevel,
-            "Can't use %s - not linked.", kextPath);
+                  "Can't use %s - not linked.", kextPath);
         goto finish;
     }
-
+    
     if (OSKextIsInterface(aKext)) {
         CFDataRef   interfaceTarget     = NULL;
         CFStringRef interfaceTargetName = NULL;
-
+        
         if (OSKextIsKernelComponent(aKext)) {
             interfaceTarget = kernelImage;
             interfaceTargetName = __kOSKextKernelIdentifier;
         } else {
-            OSKextRef interfaceTargetKext = (OSKextRef) 
-                CFArrayGetValueAtIndex(aKext->loadInfo->dependencies, 0);
-
+            OSKextRef interfaceTargetKext = (OSKextRef)
+            CFArrayGetValueAtIndex(aKext->loadInfo->dependencies, 0);
+            
             if (!interfaceTargetKext->loadInfo->linkedExecutable) {
                 __OSKextGetFileSystemPath(interfaceTargetKext,
-                    /* otherURL */ NULL,
-                    /* resolveToBase */ false, kextPath);
-
+                                          /* otherURL */ NULL,
+                                          /* resolveToBase */ false, kextPath);
+                
                 OSKextLog(aKext, kOSKextLogErrorLevel,
-                    "Can't use %s - not linked.", kextPath);
+                          "Can't use %s - not linked.", kextPath);
                 goto finish;
             }
-            interfaceTarget = 
-                interfaceTargetKext->loadInfo->linkedExecutable;
+            interfaceTarget = interfaceTargetKext->loadInfo->linkedExecutable;
             interfaceTargetName = interfaceTargetKext->bundleID;
         }
-
-        dependency->kext = (u_char *) 
-            CFDataGetBytePtr(interfaceTarget);
+        
+        dependency->kext = (u_char *) CFDataGetBytePtr(interfaceTarget);
         dependency->kext_size = CFDataGetLength(interfaceTarget);
-        dependency->kext_name = 
-            createUTF8CStringForCFString(interfaceTargetName);
-
-        dependency->interface = (u_char *) 
-            CFDataGetBytePtr(aKext->loadInfo->linkedExecutable);
+        dependency->kext_name =
+        createUTF8CStringForCFString(interfaceTargetName);
+        
+        dependency->interface = (u_char *)
+        CFDataGetBytePtr(aKext->loadInfo->linkedExecutable);
         dependency->interface_size =
-            CFDataGetLength(aKext->loadInfo->linkedExecutable);
+        CFDataGetLength(aKext->loadInfo->linkedExecutable);
         dependency->interface_name = createUTF8CStringForCFString(
-            OSKextGetIdentifier(aKext));
+                                                                  OSKextGetIdentifier(aKext));
     } else {
         dependency->kext = (u_char *)
-            CFDataGetBytePtr(aKext->loadInfo->linkedExecutable);
-        dependency->kext_size = 
-            CFDataGetLength(aKext->loadInfo->linkedExecutable);
+        CFDataGetBytePtr(aKext->loadInfo->linkedExecutable);
+        dependency->kext_size =
+        CFDataGetLength(aKext->loadInfo->linkedExecutable);
         dependency->kext_name = createUTF8CStringForCFString(
-            OSKextGetIdentifier(aKext));
-
+                                                             OSKextGetIdentifier(aKext));
         dependency->interface = NULL;
         dependency->interface_size = 0;
         dependency->interface_name = NULL;
     }
-
+    
     dependency->is_direct_dependency = isDirect;
     result = TRUE;
-
+    
 finish:
     return result;
 }
@@ -9182,111 +10256,164 @@ CFDataRef __OSKextCopyStrippedExecutable(OSKextRef aKext)
     CFMutableDataRef strippedExecutable = NULL;
     u_char *file;
     u_long fileSize;
-    u_long linkeditSize;
+    u_long amountRemoved = 0;
 
-    if (!aKext->loadInfo->linkedExecutable) goto finish;
+    if (!aKext->loadInfo->linkedExecutable) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                  "%s %d - no linkedExecutable",
+                  __func__, __LINE__);
+        goto finish;
+    }
+    
+#if SPLIT_KEXTS
+    // TODO - need to teach macho_trim_linkedit how to trim while leaving
+    // LC_SEGMENT_SPLIT_INFO data in place in __LINKEDIT segment...
+#endif
 
     fileSize = CFDataGetLength(aKext->loadInfo->linkedExecutable);
     strippedExecutable = CFDataCreateMutableCopy(kCFAllocatorDefault,
-        fileSize, aKext->loadInfo->linkedExecutable);
-    if (!strippedExecutable) goto finish;
+                                                 fileSize,
+                                                 aKext->loadInfo->linkedExecutable);
+    if (!strippedExecutable) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                  "%s %d - no strippedExecutable",
+                  __func__, __LINE__);
+        goto finish;
+    }
 
     file = (u_char *) CFDataGetMutableBytePtr(strippedExecutable);
-    if (!file) goto finish;
+    if (!file) {
+        goto finish;
+    }
 
     /* Find the linkedit segment.  If it's not the last segment, then freeing
      * it will fragment the kext into multiple VM regions, so we'll have to skip it.
      */
     if (__OSKextIsArchitectureLP64()) {
         struct segment_command_64 * linkedit =
-            macho_get_segment_by_name_64((struct mach_header_64 *)file, SEG_LINKEDIT);
-        if (!linkedit) goto finish;
-
-        if ((roundPageCrossSafe(aKext->loadInfo->loadAddress) + roundPageCrossSafe(aKext->loadInfo->loadSize)) !=
-             roundPageCrossSafe(linkedit->vmaddr) + roundPageCrossSafe(linkedit->vmsize))
-        {
+        macho_get_segment_by_name_64((struct mach_header_64 *)file, SEG_LINKEDIT);
+        if (!linkedit) {
             goto finish;
         }
+        
+        if ((roundPageCrossSafe(aKext->loadInfo->linkInfo.vmaddr_TEXT) + roundPageCrossSafe(aKext->loadInfo->linkInfo.linkedKextSize)) !=
+            roundPageCrossSafe(linkedit->vmaddr) + roundPageCrossSafe(linkedit->vmsize))
+        {
+            OSKextLog(/* kext */ NULL,
+                      kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                      "%s %d - __LINKEDIT__ segment is not last segment (%p + %llu != %p + %llu)",
+                      __func__, __LINE__,
+                      (void *)roundPageCrossSafe((vm_offset_t)(aKext->loadInfo->linkInfo.vmaddr_TEXT)),
+                      (uint64_t)roundPageCrossSafe((vm_offset_t)(aKext->loadInfo->linkInfo.linkedKextSize)),
+                      (void *)roundPageCrossSafe((vm_offset_t)(linkedit->vmaddr)),
+                      (uint64_t)roundPageCrossSafe((vm_offset_t)(linkedit->vmsize)));
+            goto finish;
+        }
+        
     } else {
         struct segment_command * linkedit =
-            macho_get_segment_by_name((struct mach_header *)file, SEG_LINKEDIT);
-        if (!linkedit) goto finish;
-
-        if ((roundPageCrossSafe(aKext->loadInfo->loadAddress) + roundPageCrossSafe(aKext->loadInfo->loadSize)) !=
-             roundPageCrossSafe(linkedit->vmaddr) + roundPageCrossSafe(linkedit->vmsize))
+        macho_get_segment_by_name((struct mach_header *)file, SEG_LINKEDIT);
+        if (!linkedit) {
+            OSKextLog(/* kext */ NULL,
+                      kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                      "%s %d - no __LINKEDIT__ segment",
+                      __func__, __LINE__);
+            goto finish;
+        }
+        
+        if ((roundPageCrossSafe(aKext->loadInfo->linkInfo.vmaddr_TEXT) + roundPageCrossSafe(aKext->loadInfo->linkInfo.linkedKextSize)) !=
+            roundPageCrossSafe(linkedit->vmaddr) + roundPageCrossSafe(linkedit->vmsize))
         {
+            OSKextLog(/* kext */ NULL,
+                      kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                      "%s %d - __LINKEDIT__ segment is not last segment (%p + %llu != %p + %llu)",
+                      __func__, __LINE__,
+                      (void *)roundPageCrossSafe((vm_offset_t)(aKext->loadInfo->linkInfo.vmaddr_TEXT)),
+                      (uint64_t)roundPageCrossSafe((vm_offset_t)(aKext->loadInfo->linkInfo.linkedKextSize)),
+                      (void *)roundPageCrossSafe((vm_offset_t)(linkedit->vmaddr)),
+                      (uint64_t)roundPageCrossSafe((vm_offset_t)(linkedit->vmsize)));
             goto finish;
         }
     }
-
+   
     /* Remove the headers and truncate the data object */
-    if (!macho_trim_linkedit(file, &linkeditSize)) {
+    if (!macho_trim_linkedit(file, &amountRemoved)) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                  "%s %d - macho_trim_linkedit failed",
+                  __func__, __LINE__);
         goto finish;
     }
 
-    fileSize -= linkeditSize;
+    fileSize -= amountRemoved;
     CFDataSetLength(strippedExecutable, fileSize);
 
     result = CFRetain(strippedExecutable);
 finish:
     SAFE_RELEASE_NULL(strippedExecutable);
+    
     return result;
 }
 
+
 /*********************************************************************
-*********************************************************************/
-static Boolean __OSKextPerformLink(
-    OSKextRef               aKext,
-    CFDataRef               kernelImage,
-    uint64_t                kernelLoadAddress,
-    Boolean                 stripSymbolsFlag,
-    KXLDContext           * kxldContext)
+ *********************************************************************/
+static Boolean __OSKextPerformSplitLink(
+                                        OSKextRef        aKext,
+                                        plkInfo *        plkInfo,
+                                        KXLDContext *    kxldContext)
 {
     Boolean                    result              = false;
     char                     * bundleIDCString     = NULL;      // must free
     CFArrayRef                 dependencies        = NULL;      // must release
     CFMutableArrayRef          indirectDependencies = NULL;     // must release
     CFDataRef                  kextExecutable      = NULL;      // must release
-
+    
     kern_return_t              kxldResult          = KERN_FAILURE;
     KXLDDependency           * kxldDependencies    = NULL;      // must free
     CFIndex                    numKxldDependencies = 0;
     kxld_addr_t                kmodInfoKern        = 0;
-
+    
     CFIndex                    numDirectDependencies    = 0;
     CFIndex                    numIndirectDependencies  = 0;
-
+    
     __OSKextKXLDCallbackContext linkAddressContext;
-
-    u_char                   * relocBytes          = NULL;    // do not free
-    u_char                  ** relocBytesPtr       = NULL;    // do not free
 
     CFDataRef                  relocData           = NULL;    // must release
     char                       kextPath[PATH_MAX];
     CFIndex                    i;
+    boolean_t                  isSplitKext = false;
 
     if (!OSKextDeclaresExecutable(aKext)) {
         result = true;
         goto finish;
     }
-
+    
     __OSKextGetFileSystemPath(aKext, /* otherURL */ NULL,
-        /* resolveToBase */ false, kextPath);
-
+                              /* resolveToBase */ false, kextPath);
+    
     kextExecutable = OSKextCopyExecutableForArchitecture(aKext,
-        OSKextGetArchitecture());
+                                                         OSKextGetArchitecture());
     if (!kextExecutable) {
         OSKextLog(aKext, kOSKextLogErrorLevel,
-            "Can't link %s - architecture %s not found", kextPath,
-            OSKextGetArchitecture()->name);
-
+                  "Can't link %s - architecture %s not found", kextPath,
+                  OSKextGetArchitecture()->name);
+        
         goto finish;
     }
 
+    kcgen_verboseLog("Linking split kext: %s", kextPath);
+
+    if (__OSKextSetLinkInfo(aKext, plkInfo, kextExecutable) == false) {
+        OSKextLog(aKext, kOSKextLogErrorLevel,
+                  "Can't get link info for '%s'", kextPath);
+        goto finish;
+    }
+    isSplitKext = __OSKextIsSplitKext(aKext);
+    
     if (OSKextIsInterface(aKext)) {
-        aKext->loadInfo->linkedExecutable = CFRetain(kextExecutable);
-        aKext->loadInfo->prelinkedExecutable = CFRetain(kextExecutable);
-        aKext->loadInfo->loadSize = CFDataGetLength(kextExecutable);
         result = true;
         goto finish;
     }
@@ -9296,200 +10423,400 @@ static Boolean __OSKextPerformLink(
         goto finish;
     }
 
-    OSKextLog(aKext, kOSKextLogProgressLevel | kOSKextLogLinkFlag,
-        "Linking %s.", kextPath);
-
-    bundleIDCString = createUTF8CStringForCFString(
-        OSKextGetIdentifier(aKext));
-
+    bundleIDCString = createUTF8CStringForCFString(OSKextGetIdentifier(aKext));
 
     numDirectDependencies = CFArrayGetCount(dependencies);
+
     if (!numDirectDependencies) {
         OSKextLog(aKext,
-            kOSKextLogErrorLevel | kOSKextLogLinkFlag,
-            "Internal error: attempting to link a kext without its dependencies.");
+                  kOSKextLogErrorLevel | kOSKextLogLinkFlag,
+                  "Internal error: attempting to link a kext without its dependencies.");
         goto finish;
     }
-
+    
     if (__OSKextGetBleedthroughFlag(aKext)) {
         numIndirectDependencies = 0;
     } else {
         indirectDependencies = OSKextCopyIndirectDependencies(aKext,
-            /* needAllFlag */ TRUE);
+                                                              /* needAllFlag */ TRUE);
         if (!indirectDependencies) {
             goto finish;
         }
-
+        
         for (i = 0; i < CFArrayGetCount(indirectDependencies); ++i) {
-            OSKextRef indirectDependency = 
-                (OSKextRef) CFArrayGetValueAtIndex(indirectDependencies, i);
-
-           /* Filter out duplicates and codeless kexts.
-            */
+            OSKextRef indirectDependency =
+            (OSKextRef) CFArrayGetValueAtIndex(indirectDependencies, i);
+            
+            /* Filter out duplicates and codeless kexts.
+             */
             if (!OSKextDeclaresExecutable(indirectDependency) ||
                 CFArrayContainsValue(dependencies, RANGE_ALL(dependencies),
-                    indirectDependency)) 
+                                     indirectDependency))
             {
                 CFArrayRemoveValueAtIndex(indirectDependencies, i);
                 i--;
                 continue;
             }
         }
-
+        
         numIndirectDependencies = CFArrayGetCount(indirectDependencies);
     }
-
+   
     numKxldDependencies = numDirectDependencies + numIndirectDependencies;
-    kxldDependencies = (KXLDDependency *) 
-        calloc(numKxldDependencies, sizeof(*kxldDependencies));
+    kxldDependencies = (KXLDDependency *)
+    calloc(numKxldDependencies, sizeof(*kxldDependencies));
     if (!kxldDependencies) {
         OSKextLogMemError();
         goto finish;
     }
-
+    
     for (i = 0; i < numDirectDependencies; i++) {
-        OSKextRef dependency = 
-            (OSKextRef) CFArrayGetValueAtIndex(dependencies, i);
-
+        OSKextRef dependency =
+        (OSKextRef) CFArrayGetValueAtIndex(dependencies, i);
+        
         if (!__OSKextInitKXLDDependency(&kxldDependencies[i],
-            dependency, kernelImage, TRUE)) {
-            
+                                        dependency,
+                                        plkInfo->kernelImage,
+                                        TRUE)) {
             goto finish;
         }
     }
-
+    
     for (i = 0; i < numIndirectDependencies; i++) {
-        OSKextRef dependency = 
-            (OSKextRef) CFArrayGetValueAtIndex(indirectDependencies, i);
-
-        if (!__OSKextInitKXLDDependency(
-            &kxldDependencies[i + numDirectDependencies], 
-            dependency, kernelImage, FALSE)) {
-            
+        OSKextRef dependency =
+        (OSKextRef) CFArrayGetValueAtIndex(indirectDependencies, i);
+        
+        if (!__OSKextInitKXLDDependency(&kxldDependencies[i + numDirectDependencies],
+                                        dependency,
+                                        plkInfo->kernelImage,
+                                        FALSE)) {
             goto finish;
         }
     }
-
-    relocBytesPtr = &relocBytes;
-
-   /* Advise the system that we need all the mmapped bytes right away.
-    */
-    (void)posix_madvise((void *)CFDataGetBytePtr(kextExecutable),
-        CFDataGetLength(kextExecutable),
-        POSIX_MADV_WILLNEED);
-
-    linkAddressContext.kernelLoadAddress = kernelLoadAddress;
+    
+    linkAddressContext.kernelLoadAddress = NULL;
     linkAddressContext.kext = aKext;
 
-    kxldResult = kxld_link_file(kxldContext,
-        (void *)CFDataGetBytePtr(kextExecutable),
-        CFDataGetLength(kextExecutable),
-        bundleIDCString,
-        /* callbackData */ (void *)&linkAddressContext,
-        kxldDependencies, numKxldDependencies,
-        relocBytesPtr, /* kmod_info */ &kmodInfoKern);
+    kxldResult = kxld_link_split_file(kxldContext,
+                                      &aKext->loadInfo->linkInfo,
+                                      bundleIDCString,
+                                      /* callbackData */ (void *)&linkAddressContext,
+                                      kxldDependencies,
+                                      numKxldDependencies,
+                                      &kmodInfoKern);
+#if SPLIT_KEXTS_DEBUG
+    {
+        u_char *kext_exe = (u_char *)CFDataGetBytePtr(kextExecutable);
+        unsigned int kext_exe_sz = (unsigned int)CFDataGetLength(kextExecutable);
+        u_char *linked_kext = (u_char *)aKext->loadInfo->linkInfo.linkedKext;
+        unsigned int linked_kext_sz = (unsigned int)aKext->loadInfo->linkInfo.linkedKextSize;
+
+        kcgen_verboseLog("Linked %s from %p-%p (%d) into %p-%p (%d)", kextPath,
+                         kext_exe, kext_exe + kext_exe_sz, kext_exe_sz,
+                         linked_kext, linked_kext + linked_kext_sz, linked_kext_sz);
+    }
+#endif
 
     for (i = 0; i < numKxldDependencies; i++) {
         SAFE_FREE(kxldDependencies[i].kext_name);
         SAFE_FREE(kxldDependencies[i].interface_name);
     }
-
+    
     if (kxldResult != KERN_SUCCESS) {
-        OSKextLog(aKext, kOSKextLogErrorLevel | kOSKextLogLinkFlag,
-            "Link failed (error code %d).", kxldResult);
+        OSKextLog(NULL, kOSKextLogErrorLevel | kOSKextLogLoadFlag,
+                  "%s - Link error %d for \"%s\"",
+                  __func__, kxldResult, kextPath);
         goto finish;
     }
 
-    if (relocBytes && aKext->loadInfo->loadSize) {
+    if (aKext->loadInfo->linkInfo.kaslr_offsets) {
+        if (!__OSKextConvertExeOfstsToLinkedOfsts(aKext)) {
+            OSKextLog(NULL, kOSKextLogErrorLevel | kOSKextLogLoadFlag,
+                      "%s - KASLR offset conversion error for \"%s\"",
+                      __func__, kextPath);
+            goto finish;
+        }
+    }
+
+    if (aKext->loadInfo->linkInfo.linkedKext &&
+        aKext->loadInfo->linkInfo.linkedKextSize) {
+
         relocData = CFDataCreateWithBytesNoCopy(CFGetAllocator(aKext),
-            relocBytes, aKext->loadInfo->loadSize, kCFAllocatorDefault);
+                                                aKext->loadInfo->linkInfo.linkedKext,
+                                                aKext->loadInfo->linkInfo.linkedKextSize,
+                                                kCFAllocatorNull);
         if (!relocData) {
             OSKextLogMemError();
             goto finish;
         }
         aKext->loadInfo->linkedExecutable = CFRetain(relocData);
         aKext->loadInfo->kmodInfoAddress = kmodInfoKern;
-
-        if (stripSymbolsFlag) {
-#define KMOD_INFO_DEBUG 0
-#if KMOD_INFO_DEBUG
-            u_int64_t   originalLoadSize = aKext->loadInfo->loadSize;
-#endif  // KMOD_INFO_DEBUG
-
-            aKext->loadInfo->prelinkedExecutable = __OSKextCopyStrippedExecutable(aKext);
-            if (!aKext->loadInfo->prelinkedExecutable) {
-                char tempStr[1024];
-
-                CFStringGetCString(aKext->bundleID, tempStr, sizeof(tempStr), 
-                                   kCFStringEncodingUTF8);
-                OSKextLog(aKext, kOSKextLogErrorLevel | kOSKextLogLinkFlag,
-                          "Can't strip executable for %s", tempStr);
-
-                aKext->loadInfo->prelinkedExecutable = CFRetain(relocData);
-
-                /* XXX: Should we fail here? Seems like the right thing to do for
-                 * security reasons */
-                goto finish;
-            }
-
-            aKext->loadInfo->loadSize = CFDataGetLength(aKext->loadInfo->prelinkedExecutable);
-
-            // 03/16/12 - <rdar://problem/10980607>
-            // must update the kmod_info.size field embedded within the kext image
-            {
-                u_char      *file = (u_char *) CFDataGetMutableBytePtr((CFMutableDataRef) aKext->loadInfo->prelinkedExecutable);
-                Boolean     is_32bit_kext = ((struct mach_header *) file)->magic == MH_MAGIC;
-                u_int64_t   kmodInfo_offset = kmodInfoKern - aKext->loadInfo->loadAddress;
-                vm_size_t   *size_field = (vm_size_t *) (is_32bit_kext ? 
-                                (file + kmodInfo_offset + offsetof(kmod_info_32_v1_t, size)) : 
-                                (file + kmodInfo_offset + offsetof(kmod_info_64_v1_t, size)));
-
-#if KMOD_INFO_DEBUG
-                vm_size_t   original_kmodInfo_size = *size_field;
-                OSKextLog(aKext, kOSKextLogDebugLevel | kOSKextLogLinkFlag | kOSKextLogLoadFlag,
-                          "--original load size: 0x%.8llx, original kmod_info.size: 0x%.8x",
-                          originalLoadSize, (unsigned int) original_kmodInfo_size);
-#endif  // KMOD_INFO_DEBUG
-
-                *size_field = aKext->loadInfo->loadSize;
-
-#if KMOD_INFO_DEBUG
-                OSKextLog(aKext, kOSKextLogDebugLevel | kOSKextLogLinkFlag | kOSKextLogLoadFlag,
-                          "--     new load size: 0x%.8zx,      new kmod_info.size: 0x%.8x",
-                          aKext->loadInfo->loadSize, (unsigned int) *size_field);
-#endif  // KMOD_INFO_DEBUG
-
-            }
-        }
-
-        if (!aKext->loadInfo->prelinkedExecutable) {
-            aKext->loadInfo->prelinkedExecutable = CFRetain(relocData);
-        }
     }
 
     result = true;
 
 finish:
+        /* Advise the system that we no longer need the mmapped executable.
+         */
+        SAFE_RELEASE(kextExecutable);
+        SAFE_RELEASE(dependencies);
+        SAFE_RELEASE(indirectDependencies);
 
-   /* Advise the system that we no longer need the mmapped executable.
-    */
-    if (kextExecutable) {
-        (void)posix_madvise((void *)CFDataGetBytePtr(kextExecutable),
-            CFDataGetLength(kextExecutable),
-            POSIX_MADV_DONTNEED);
-    }
+        SAFE_RELEASE(relocData);
 
-    SAFE_RELEASE(kextExecutable);
-    SAFE_RELEASE(dependencies);
-    SAFE_RELEASE(indirectDependencies);
+        SAFE_FREE(kxldDependencies);
+        SAFE_FREE(bundleIDCString);
 
-    SAFE_RELEASE(relocData);
-
-    SAFE_FREE(kxldDependencies);
-    SAFE_FREE(bundleIDCString);
-
-    return result;
+        return result;
 }
+
+/*********************************************************************
+ *********************************************************************/
+static Boolean __OSKextPerformLink(
+                                   OSKextRef        aKext,
+                                   CFDataRef        kernelImage,
+                                   uint64_t         kernelLoadAddress,
+                                   Boolean          stripSymbolsFlag,
+                                   KXLDContext *    kxldContext)
+{
+    Boolean                    result              = false;
+    char                     * bundleIDCString     = NULL;      // must free
+    CFArrayRef                 dependencies        = NULL;      // must release
+    CFMutableArrayRef          indirectDependencies = NULL;     // must release
+    CFDataRef                  kextExecutable      = NULL;      // must release
+    
+    kern_return_t              kxldResult          = KERN_FAILURE;
+    KXLDDependency           * kxldDependencies    = NULL;      // must free
+    CFIndex                    numKxldDependencies = 0;
+    kxld_addr_t                kmodInfoKern        = 0;
+    
+    CFIndex                    numDirectDependencies    = 0;
+    CFIndex                    numIndirectDependencies  = 0;
+    
+    __OSKextKXLDCallbackContext linkAddressContext;
+    
+    u_char                   * relocBytes          = NULL;    // do not free
+    u_char                  ** relocBytesPtr       = NULL;    // do not free
+    
+    CFDataRef                  relocData           = NULL;    // must release
+    char                       kextPath[PATH_MAX];
+    CFIndex                    i;
+    
+    if (!OSKextDeclaresExecutable(aKext)) {
+        result = true;
+        goto finish;
+    }
+    
+    __OSKextGetFileSystemPath(aKext, /* otherURL */ NULL,
+                              /* resolveToBase */ false, kextPath);
+    
+    kextExecutable = OSKextCopyExecutableForArchitecture(aKext,
+                                                         OSKextGetArchitecture());
+    if (!kextExecutable) {
+        OSKextLog(aKext, kOSKextLogErrorLevel,
+                  "Can't link %s - architecture %s not found", kextPath,
+                  OSKextGetArchitecture()->name);
+        
+        goto finish;
+    }
+    
+    
+    if (OSKextIsInterface(aKext)) {
+        aKext->loadInfo->linkedExecutable = CFRetain(kextExecutable);
+        aKext->loadInfo->prelinkedExecutable = CFRetain(kextExecutable);
+        aKext->loadInfo->linkInfo.linkedKextSize = CFDataGetLength(kextExecutable);
+        result = true;
+        goto finish;
+    }
+    
+    dependencies = OSKextCopyLinkDependencies(aKext, /* needAll */ true);
+    if (!dependencies) {
+        goto finish;
+    }
+    
+    OSKextLog(aKext, kOSKextLogProgressLevel | kOSKextLogLinkFlag,
+              "Linking %s.", kextPath);
+    
+    bundleIDCString = createUTF8CStringForCFString(
+                                                   OSKextGetIdentifier(aKext));
+    
+    
+    numDirectDependencies = CFArrayGetCount(dependencies);
+    if (!numDirectDependencies) {
+        OSKextLog(aKext,
+                  kOSKextLogErrorLevel | kOSKextLogLinkFlag,
+                  "Internal error: attempting to link a kext without its dependencies.");
+        goto finish;
+    }
+    
+    if (__OSKextGetBleedthroughFlag(aKext)) {
+        numIndirectDependencies = 0;
+    } else {
+        indirectDependencies = OSKextCopyIndirectDependencies(aKext,
+                                                              /* needAllFlag */ TRUE);
+        if (!indirectDependencies) {
+            goto finish;
+        }
+        
+        for (i = 0; i < CFArrayGetCount(indirectDependencies); ++i) {
+            OSKextRef indirectDependency =
+            (OSKextRef) CFArrayGetValueAtIndex(indirectDependencies, i);
+            
+            /* Filter out duplicates and codeless kexts.
+             */
+            if (!OSKextDeclaresExecutable(indirectDependency) ||
+                CFArrayContainsValue(dependencies, RANGE_ALL(dependencies),
+                                     indirectDependency))
+            {
+                CFArrayRemoveValueAtIndex(indirectDependencies, i);
+                i--;
+                continue;
+            }
+        }
+        
+        numIndirectDependencies = CFArrayGetCount(indirectDependencies);
+    }
+    
+    numKxldDependencies = numDirectDependencies + numIndirectDependencies;
+    kxldDependencies = (KXLDDependency *) calloc(numKxldDependencies, sizeof(*kxldDependencies));
+    if (!kxldDependencies) {
+        OSKextLogMemError();
+        goto finish;
+    }
+    
+    for (i = 0; i < numDirectDependencies; i++) {
+        OSKextRef dependency =
+        (OSKextRef) CFArrayGetValueAtIndex(dependencies, i);
+        
+        if (!__OSKextInitKXLDDependency(&kxldDependencies[i],
+                                        dependency, kernelImage, TRUE)) {
+            
+            goto finish;
+        }
+    }
+    
+    for (i = 0; i < numIndirectDependencies; i++) {
+        OSKextRef dependency =
+        (OSKextRef) CFArrayGetValueAtIndex(indirectDependencies, i);
+        
+        if (!__OSKextInitKXLDDependency(
+                                        &kxldDependencies[i + numDirectDependencies],
+                                        dependency, kernelImage, FALSE)) {
+            
+            goto finish;
+        }
+    }
+    
+    relocBytesPtr = &relocBytes;
+    
+    linkAddressContext.kernelLoadAddress = kernelLoadAddress;
+    linkAddressContext.kext = aKext;
+    
+    kxldResult = kxld_link_file(kxldContext,
+                                (void *)CFDataGetBytePtr(kextExecutable),
+                                CFDataGetLength(kextExecutable),
+                                bundleIDCString,
+                                /* callbackData */ (void *)&linkAddressContext,
+                                kxldDependencies, numKxldDependencies,
+                                relocBytesPtr,
+                                &kmodInfoKern);
+    
+    for (i = 0; i < numKxldDependencies; i++) {
+        SAFE_FREE(kxldDependencies[i].kext_name);
+        SAFE_FREE(kxldDependencies[i].interface_name);
+    }
+    
+    if (kxldResult != KERN_SUCCESS) {
+        OSKextLog(aKext, kOSKextLogErrorLevel | kOSKextLogLinkFlag,
+                  "Link failed (error code %d).", kxldResult);
+        goto finish;
+    }
+    
+        if (relocBytes && aKext->loadInfo->linkInfo.linkedKextSize) {
+            relocData = CFDataCreateWithBytesNoCopy(CFGetAllocator(aKext),
+                                                    relocBytes,
+                                                    aKext->loadInfo->linkInfo.linkedKextSize,
+                                                    kCFAllocatorDefault);
+            if (!relocData) {
+                OSKextLogMemError();
+                goto finish;
+            }
+            aKext->loadInfo->linkedExecutable = CFRetain(relocData);
+            aKext->loadInfo->kmodInfoAddress = kmodInfoKern;
+            
+            if (stripSymbolsFlag) {
+#define KMOD_INFO_DEBUG 0
+#if KMOD_INFO_DEBUG
+                u_int64_t   originalLoadSize = aKext->loadInfo->linkInfo.linkedKextSize;
+#endif  // KMOD_INFO_DEBUG
+                
+                aKext->loadInfo->prelinkedExecutable = __OSKextCopyStrippedExecutable(aKext);
+                if (!aKext->loadInfo->prelinkedExecutable) {
+                    char tempStr[1024];
+                    
+                    CFStringGetCString(aKext->bundleID, tempStr, sizeof(tempStr),
+                                       kCFStringEncodingUTF8);
+                    OSKextLog(aKext, kOSKextLogErrorLevel | kOSKextLogLinkFlag,
+                              "Can't strip executable for %s <%s>", tempStr, __func__);
+                    
+                    aKext->loadInfo->prelinkedExecutable = CFRetain(relocData);
+                    
+                    /* XXX: Should we fail here? Seems like the right thing to do for
+                     * security reasons */
+                    goto finish;
+                }
+                
+                aKext->loadInfo->linkInfo.linkedKextSize = CFDataGetLength(aKext->loadInfo->prelinkedExecutable);
+                
+                // 03/16/12 - <rdar://problem/10980607>
+                // must update the kmod_info.size field embedded within the kext image
+                {
+                    u_char      *file = (u_char *) CFDataGetMutableBytePtr((CFMutableDataRef) aKext->loadInfo->prelinkedExecutable);
+                    Boolean     is_32bit_kext = ((struct mach_header *) file)->magic == MH_MAGIC;
+                    u_int64_t   kmodInfo_offset = kmodInfoKern - aKext->loadInfo->linkInfo.vmaddr_TEXT;
+                    vm_size_t   *size_field = (vm_size_t *) (is_32bit_kext ?
+                                                             (file + kmodInfo_offset + offsetof(kmod_info_32_v1_t, size)) :
+                                                             (file + kmodInfo_offset + offsetof(kmod_info_64_v1_t, size)));
+                    
+#if KMOD_INFO_DEBUG
+                    vm_size_t   original_kmodInfo_size = *size_field;
+                    OSKextLog(aKext, kOSKextLogDebugLevel | kOSKextLogLinkFlag | kOSKextLogLoadFlag,
+                              "--original load size: 0x%.8llx, original kmod_info.size: 0x%.8x",
+                              originalLoadSize, (unsigned int) original_kmodInfo_size);
+#endif  // KMOD_INFO_DEBUG
+                    
+                    *size_field = aKext->loadInfo->linkInfo.linkedKextSize;
+                    
+#if KMOD_INFO_DEBUG
+                    OSKextLog(aKext, kOSKextLogDebugLevel | kOSKextLogLinkFlag | kOSKextLogLoadFlag,
+                              "--     new load size: 0x%.8zx,      new kmod_info.size: 0x%.8x",
+                              aKext->loadInfo->linkInfo.linkedKextSize, (unsigned int) *size_field);
+#endif  // KMOD_INFO_DEBUG
+                    
+                }
+            }
+            
+            if (!aKext->loadInfo->prelinkedExecutable) {
+                aKext->loadInfo->prelinkedExecutable = CFRetain(relocData);
+            }
+        } // relocBytes...
+        
+        result = true;
+        
+    finish:
+        
+        SAFE_RELEASE(kextExecutable);
+        SAFE_RELEASE(dependencies);
+        SAFE_RELEASE(indirectDependencies);
+        
+        SAFE_RELEASE(relocData);
+        
+        SAFE_FREE(kxldDependencies);
+        SAFE_FREE(bundleIDCString);
+        
+        return result;
+}
+
 
 /*********************************************************************
 *********************************************************************/
@@ -9539,6 +10866,10 @@ Boolean __OSKextGenerateDebugSymbols(
     CFArrayRef    dependencies        = NULL;       // must release
     CFIndex       count, i;
 
+    if (__OSKextIsSplitKext(aKext)) {
+        // not supported yet
+        goto finish;
+    }
 
     if (!__OSKextCreateLoadInfo(aKext)) {
         OSKextLogMemError();
@@ -9572,7 +10903,8 @@ Boolean __OSKextGenerateDebugSymbols(
     }
 
     result = __OSKextPerformLink(aKext, kernelImage, kernelLoadAddress,
-        false /* stripSymbolsFlag */, kxldContext);
+                                 false /* stripSymbolsFlag */, kxldContext);
+    
     if (!result) {
         goto finish;
     }
@@ -9605,8 +10937,7 @@ kxld_addr_t __OSKextLinkAddressCallback(
     __OSKextKXLDCallbackContext * context =
         (__OSKextKXLDCallbackContext *)user_data;
 
-    context->kext->loadInfo->loadSize = size;
-
+    context->kext->loadInfo->linkInfo.linkedKextSize = size;
     kextAddress = (kxld_addr_t)OSKextGetLoadAddress(context->kext);
     if (kextAddress) {
         result = kextAddress;
@@ -9614,6 +10945,7 @@ kxld_addr_t __OSKextLinkAddressCallback(
         result = context->kernelLoadAddress + loadAddressOffset;
         loadAddressOffset += size;
     }
+
     return result;
 }
 
@@ -9686,7 +11018,7 @@ static uint64_t __OSKextSetupCrossLinkByArch(cpu_type_t cputype)
         if (!setCrossLinkPageSize(crossLinkPageSize)) {
             OSKextLog(/* kext */ NULL, kOSKextLogErrorLevel | kOSKextLogLinkFlag,
                  "Can't setup cross linking page size = 0x%lx.",
-                 crossLinkPageSize);
+                 (long) crossLinkPageSize);
         }
     }
 
@@ -9700,12 +11032,11 @@ static uint64_t __OSKextSetupCrossLinkByArch(cpu_type_t cputype)
     return kxldPageSize;
 }
 
-
 /*********************************************************************
-*********************************************************************/
+ *********************************************************************/
 CFDictionaryRef OSKextGenerateDebugSymbols(
-    OSKextRef aKext,
-    CFDataRef kernelImage)
+                                           OSKextRef aKext,
+                                           CFDataRef kernelImage)
 {
     CFMutableDictionaryRef   result             = NULL;
     CFDataRef                kernelImageCopy    = NULL;
@@ -9719,19 +11050,19 @@ CFDictionaryRef OSKextGenerateDebugSymbols(
     fat_iterator             fatIterator        = NULL; // must fat_iterator_close()
     struct mach_header_64 *  machHeader         = NULL; // do not free
     uint64_t                 kxldPageSize       = 0;
-
+    
     if (!kernelImage) {
         OSKextLog(aKext, kOSKextLogErrorLevel | kOSKextLogLinkFlag,
                   "Can't generate debug symbols; no kernel file provided ");
         goto finish;
     }
-
+    
     if (!OSKextResolveDependencies(aKext)) {
         goto finish;
     }
-
+    
     result = CFDictionaryCreateMutable(CFGetAllocator(aKext), 0,
-        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+                                       &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     if (!result) {
         OSKextLogMemError();
         goto finish;
@@ -9747,10 +11078,10 @@ CFDictionaryRef OSKextGenerateDebugSymbols(
         goto finish;
     }
     machHeader = (struct mach_header_64 *)
-        fat_iterator_find_arch(fatIterator,
-                               OSKextGetArchitecture()->cputype, 
-                               OSKextGetArchitecture()->cpusubtype,
-                               NULL);
+    fat_iterator_find_arch(fatIterator,
+                           OSKextGetArchitecture()->cputype,
+                           OSKextGetArchitecture()->cpusubtype,
+                           NULL);
     if (!machHeader) {
         OSKextLog(/* kext */ NULL, kOSKextLogErrorLevel | kOSKextLogFileAccessFlag,
                   "Can't find architecture %s in kernel file.",
@@ -9764,43 +11095,45 @@ CFDictionaryRef OSKextGenerateDebugSymbols(
         kxldFlags |= kKXLDFlagIncludeRelocs;
     }
     else {
-        OSKextLog(NULL, 
+        OSKextLog(NULL,
                   kOSKextLogErrorLevel | kOSKextLogFileAccessFlag,
                   "kernel does NOT support KASLR");
     }
-
+    
     /* Handle cross-linking if necessary */
     kxldPageSize = __OSKextSetupCrossLinkByArch(OSKextGetArchitecture()->cputype);
-
+    
     kxldResult = kxld_create_context(&kxldContext, __OSKextLinkAddressCallback,
-        __OSKextLoggingCallback, kxldFlags, OSKextGetArchitecture()->cputype, 
-        OSKextGetArchitecture()->cpusubtype, kxldPageSize);
+                                     __OSKextLoggingCallback, kxldFlags, OSKextGetArchitecture()->cputype,
+                                     OSKextGetArchitecture()->cpusubtype, kxldPageSize);
+ 
     if (kxldResult != KERN_SUCCESS) {
         OSKextLog(aKext, kOSKextLogErrorLevel | kOSKextLogLinkFlag,
-             "Can't create link context.");
+                  "Can't create link context.");
         goto finish;
     }
-
+    
     kernelLoadAddress = __OSKextGetFakeLoadAddress(kernelImage);
     if (!kernelLoadAddress) {
         goto finish;
     }
-
+    
     if (!__OSKextGenerateDebugSymbols(aKext, kernelImage,
-        kernelLoadAddress, kxldContext, result)) 
+                                      kernelLoadAddress, kxldContext, result))
     {
         SAFE_RELEASE_NULL(result);
         goto finish;
     }
-
+    
 finish:
     SAFE_RELEASE(kernelImageCopy);
-
+    
     if (kxldContext) kxld_destroy_context(kxldContext);
     if (fatIterator) fat_iterator_close(fatIterator);
-
+    
     return result;
 }
+
 
 /*********************************************************************
 *********************************************************************/
@@ -10057,7 +11390,7 @@ OSReturn OSKextSendKextPersonalitiesToKernel(
     CFMutableArrayRef mutablePersonalities = NULL;  // do not release; alias
     char              kextPath[PATH_MAX];
     char            * nameCString          = NULL;  // must free
-    CFIndex           count, i;
+    CFIndex           count;
 
     __OSKextGetFileSystemPath(aKext, /* otherURL */ NULL,
         /* resolveToBase */ false, kextPath);
@@ -10078,22 +11411,33 @@ OSReturn OSKextSendKextPersonalitiesToKernel(
                 kextPath);
         }
     } else {
+        __OSKextPersonalityPatcherContext context;
+
         CFDictionaryRef allPersonalities = OSKextGetValueForInfoDictionaryKey(
             aKext, CFSTR(kIOKitPersonalitiesKey));
-
         if (!allPersonalities && !CFDictionaryGetCount(allPersonalities)) {
             OSKextLog(aKext, kOSKextLogStepLevel | kOSKextLogLoadFlag,
                 "%s has no personalities to send to kernel.",
                 kextPath);
             goto finish;
         }
+
+        /* Make sure all named personalities match one in the kext */
+        for (CFIndex i = 0; i < CFArrayGetCount(personalityNames); i++) {
+            CFStringRef name = CFArrayGetValueAtIndex(personalityNames, i);
+            if (!CFDictionaryContainsKey(allPersonalities, name)) {
+                OSKextLogCFString(aKext, kOSKextLogErrorLevel | kOSKextLogLoadFlag,
+                    CFSTR("Personality %@ not found in %s."), name, kextPath);
+                goto finish;
+            }
+        }
+
         mutablePersonalities = CFArrayCreateMutable(CFGetAllocator(aKext),
-            0, &kCFTypeArrayCallBacks);
+                        CFArrayGetCount(personalityNames), &kCFTypeArrayCallBacks);
         if (!mutablePersonalities) {
             OSKextLogMemError();
             goto finish;
         }
-        personalities = mutablePersonalities;
 
         OSKextLog(aKext,
             kOSKextLogDetailLevel |
@@ -10101,32 +11445,16 @@ OSReturn OSKextSendKextPersonalitiesToKernel(
             "Sending named personalities of %s to the kernel:",
             kextPath);
 
-        for (i = 0; i < count; i++) {
-            CFStringRef     name = CFArrayGetValueAtIndex(personalityNames, i);
-            CFDictionaryRef personality = CFDictionaryGetValue(allPersonalities,
-                name);
+        context.kext               = aKext;
+        context.personalitiesArray = result;
+        context.personalitiesDict  = NULL; /* We want an array, not a dict */
+        context.personalityNames   = personalityNames;
+        context.includeBundleIDs   = false;
 
-            SAFE_FREE_NULL(nameCString);
-            nameCString = createUTF8CStringForCFString(name);
-            if (!nameCString) {
-                OSKextLogMemError();
-                goto finish;
-            }
-
-            if (!personality) {
-                OSKextLog(aKext,
-                    kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
-                    "Personality %s not found in %s.",
-                    nameCString, kextPath);
-                result = kOSKextReturnInvalidArgument;
-                goto finish;
-            }
-
-            OSKextLog(aKext,
-                kOSKextLogDetailLevel | kOSKextLogLoadFlag | kOSKextLogIPCFlag,
-                "    %s", nameCString);
-            CFArrayAppendValue(mutablePersonalities, personality);
-        }
+        CFDictionaryApplyFunction(allPersonalities,
+            __OSKextPersonalityPatcherApplierFunction,
+            &context);
+        personalities = context.personalitiesArray;
     }
 
     if (personalities && CFArrayGetCount(personalities)) {
@@ -10463,8 +11791,7 @@ static void __OSKextCheckLoaded(OSKextRef aKext)
         uint32_t loadSize;
         if (CFNumberGetValue(scratchNumber, kCFNumberSInt32Type,
             &loadSize)) {
-
-            aKext->loadInfo->loadSize = loadSize;
+                aKext->loadInfo->linkInfo.linkedKextSize = loadSize;
         } else {
             // xxx - log an error?
         }
@@ -10590,7 +11917,7 @@ uint64_t OSKextGetLoadAddress(OSKextRef aKext)
     if (aKext->loadInfo->kernelLoadInfo) {
         __OSKextCheckLoaded(aKext);
     }
-    result = aKext->loadInfo->loadAddress;
+    result = aKext->loadInfo->linkInfo.vmaddr_TEXT;
     
 finish:
     return result;
@@ -10631,7 +11958,8 @@ Boolean __OSKextSetLoadAddress(OSKextRef aKext, uint64_t address)
             kextPath, (int)address);
     }
 
-    aKext->loadInfo->loadAddress = address;
+    aKext->loadInfo->linkInfo.vmaddr_TEXT = address;
+
     result = true;
 finish:
     return result;
@@ -10742,7 +12070,6 @@ void OSKextFlushLoadInfo(
             }
 
             SAFE_RELEASE_NULL(aKext->loadInfo->kernelLoadInfo);
-            SAFE_RELEASE_NULL(aKext->loadInfo->executableURL);
             SAFE_RELEASE_NULL(aKext->loadInfo->executable);
             SAFE_RELEASE_NULL(aKext->loadInfo->linkedExecutable);
             SAFE_RELEASE_NULL(aKext->loadInfo->prelinkedExecutable);
@@ -10751,17 +12078,22 @@ void OSKextFlushLoadInfo(
             }
             SAFE_FREE_NULL(aKext->loadInfo);
 
-           /* The executable could change by the time we read it again,
-            * so clear all validation/authentication flags. Leave
-            * diagnostics in place (a bit funky I suppose).
-            */
-            aKext->flags.valid = 0;
-            aKext->flags.invalid = 0;
-            aKext->flags.validated = 0;
-            aKext->flags.authentic = 0;
-            aKext->flags.inauthentic = 0;
-            aKext->flags.authenticated = 0;
-            aKext->flags.isSigned = 0;
+            // Flush cached auth bits for non-Apple (or invalid or inauthentic) kexts only
+            if (!aKext->flags.rootless_trusted ||
+                !aKext->flags.valid ||
+                !aKext->flags.authentic) {
+               /* The executable could change by the time we read it again,
+                * so clear all validation/authentication flags. Leave
+                * diagnostics in place (a bit funky I suppose).
+                */
+                aKext->flags.valid = 0;
+                aKext->flags.invalid = 0;
+                aKext->flags.validated = 0;
+                aKext->flags.authentic = 0;
+                aKext->flags.inauthentic = 0;
+                aKext->flags.authenticated = 0;
+                aKext->flags.isSigned = 0;
+            }
        }
     } else if (__sOSKextsByURL) {
         flushingAll = true;
@@ -10914,6 +12246,158 @@ CFArrayRef OSKextCreateLoadedKextInfo(
 
 finish:
     SAFE_RELEASE(allLoadInfoDict);
+    return result;
+}
+
+CFDictionaryRef OSKextCopyLoadedKextInfoByUUID(
+    CFArrayRef kextIdentifiers,
+    CFArrayRef infoKeys)
+{
+
+    CFDictionaryRef        result        = NULL;
+    OSReturn               op_result     = kOSReturnError;
+    CFMutableDictionaryRef requestDict   = NULL;  // must release
+    CFMutableDictionaryRef requestArgs   = NULL;  // do not release
+    CFStringRef            infoString    = NULL;  // must release
+    char                 * infoCString   = NULL;  // must free
+
+    OSKextLog(/* kext */ NULL,
+        kOSKextLogStepLevel | kOSKextLogIPCFlag,
+        "Reading loaded kext info from kernel.");
+
+    requestDict = __OSKextCreateKextRequest(CFSTR(kKextRequestPredicateGetLoadedByUUID),
+        kextIdentifiers, &requestArgs);
+
+    if (!requestDict) {
+        OSKextLog(/* kext */ NULL,
+            kOSKextLogErrorLevel | kOSKextLogIPCFlag,
+            "Failed to create kext request.");
+        goto finish;
+    }
+
+    if (infoKeys && CFArrayGetCount(infoKeys)) {
+        CFDictionarySetValue(requestArgs,
+            CFSTR(kKextRequestArgumentInfoKeysKey),
+            infoKeys);
+    }
+
+    op_result = __OSKextSendKextRequest(/* kext */ NULL, requestDict,
+        (CFTypeRef *)&result,
+        /* rawResponseOut */ NULL, /* rawResponseLengthOut */ NULL);
+    if (op_result != kOSReturnSuccess) {
+        OSKextLog(/* kext */ NULL,
+            kOSKextLogErrorLevel | kOSKextLogIPCFlag,
+            "Failed to read loaded kext info from kernel - %s.",
+            safe_mach_error_string(op_result));
+        SAFE_RELEASE_NULL(result);
+        goto finish;
+    }
+
+    if (!result) {
+        OSKextLog(/* kext */ NULL,
+            kOSKextLogErrorLevel | kOSKextLogIPCFlag,
+            "Kernel request call returned no data.");
+        goto finish;
+    }
+    if (CFDictionaryGetTypeID() != CFGetTypeID(result)) {
+        SAFE_RELEASE_NULL(result);
+        // xxx - these flags don't seem quite right
+        OSKextLog(/* kext */ NULL,
+            kOSKextLogErrorLevel | kOSKextLogIPCFlag,
+            "Loaded kext info from kernel is wrong type.");
+        goto finish;
+    }
+
+    if (__OSKextShouldLog(/* kext */ NULL,
+        kOSKextLogDebugLevel | kOSKextLogLoadFlag | kOSKextLogIPCFlag)) {
+
+        infoString = createCFStringForPlist_new(result,
+            kPListStyleClassic);
+        infoCString = createUTF8CStringForCFString(infoString);
+        OSKextLog(/* kext */ NULL,
+            kOSKextLogDebugLevel | kOSKextLogLoadFlag | kOSKextLogIPCFlag,
+            "Loaded kext info:\n%s", infoCString);
+    }
+
+finish:
+    SAFE_RELEASE(requestDict);
+    SAFE_RELEASE(infoString);
+    SAFE_FREE(infoCString);
+
+    return result;
+}
+
+/*********************************************************************
+ *********************************************************************/
+// Temporarily defining these macros here to make the build happy.
+// Will go away once the the predicate definitions are available in xnu.
+
+#ifndef kKextRequestPredicateGetUUIDByAddress
+#define kKextRequestPredicateGetUUIDByAddress      "Get Kext UUID by Address"
+#endif
+
+#ifndef kKextRequestArgumentLookupAddressKey
+#define kKextRequestArgumentLookupAddressKey       "Kext Request Lookup Address"
+#endif
+
+CF_EXPORT CFDataRef
+OSKextCopyUUIDForAddress(
+    uint64_t address)
+{
+    CFDataRef              result        = NULL;
+    OSReturn               op_result     = kOSReturnError;
+    CFMutableDictionaryRef requestDict   = NULL;  // must release
+    CFMutableDictionaryRef requestArgs   = NULL;  // do not release
+    CFNumberRef            lookupNum     = NULL;
+
+    OSKextLog(/* kext */ NULL,
+              kOSKextLogStepLevel | kOSKextLogIPCFlag,
+              "Reading kext UUID for Address\n.");
+
+    requestDict = __OSKextCreateKextRequest(CFSTR(kKextRequestPredicateGetUUIDByAddress),
+                                            NULL, &requestArgs);
+
+    if (!requestDict) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogErrorLevel | kOSKextLogIPCFlag,
+                  "Failed to create kext request.");
+        goto finish;
+    }
+
+    lookupNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &address);
+    if (!lookupNum) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogErrorLevel | kOSKextLogIPCFlag,
+                  "Failed to create lookup address object.");
+        goto finish;
+    }
+
+    CFDictionarySetValue(requestArgs,
+                         CFSTR(kKextRequestArgumentLookupAddressKey),
+                         lookupNum);
+
+    op_result = __OSKextSendKextRequest(/* kext */ NULL, requestDict,
+                                        (CFTypeRef *) &result,
+                                        /* rawResponseOut */ NULL, /* rawResponseLengthOut */ NULL);
+    if (op_result != kOSReturnSuccess) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogErrorLevel | kOSKextLogIPCFlag,
+                  "Failed to lookup uuid with address from kernel - %s.",
+                  safe_mach_error_string(op_result));
+        SAFE_RELEASE_NULL(result);
+        goto finish;
+    }
+
+    if (!result) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogErrorLevel | kOSKextLogIPCFlag,
+                  "Kernel request call returned no data.");
+        goto finish;
+    }
+
+finish:
+    SAFE_RELEASE(requestDict);
+    SAFE_RELEASE(lookupNum);
     return result;
 }
 
@@ -11370,6 +12854,31 @@ static void __OSKextValidateIOKitPersonalityApplierFunction(
 
     CFArrayRemoveValueAtIndex(context->propPath,
         CFArrayGetCount(context->propPath) - 1);
+
+
+    if (OSKextDeclaresUserExecutable(context->kext)) {
+        propKey = CFSTR(kCFBundleIdentifierKernelKey);
+        CFArrayAppendValue(context->propPath, propKey);
+
+        checkResult = __OSKextCheckProperty(context->kext,
+            personality,
+            /* propKey */ propKey,
+            /* diagnosticValue */ context->propPath,
+            /* expectedType */ CFStringGetTypeID(),
+            /* legalValues */ NULL,
+            /* required */ true,
+            /* typeRequired */ true,
+            /* nonnilRequired */ true,
+            /* valueOut */ (CFTypeRef *)&stringValue,
+            &valueIsNonnil);
+        if (!checkResult) {
+            __OSKextSetDiagnostic(context->kext, kOSKextDiagnosticsFlagValidation,
+                    kOSKextDiagnosticMissingDesignatedKernelClass);
+        }
+
+        CFArrayRemoveValueAtIndex(context->propPath,
+            CFArrayGetCount(context->propPath) - 1);
+    }
 
    /*********************
     * end of properties *
@@ -11855,14 +13364,6 @@ Boolean __OSKextValidateExecutable(OSKextRef aKext)
     result = true;
 
 finish:
-   /* Advise the system that we no longer need the mmapped executable.
-    */
-    if (executable) {
-        (void)posix_madvise((void *)CFDataGetBytePtr(executable),
-            CFDataGetLength(executable),
-            POSIX_MADV_DONTNEED);
-    }
-
     // xxx - how do we handle cleanup of load info?
     SAFE_RELEASE(executable);
     SAFE_RELEASE(kmodName);
@@ -11908,12 +13409,10 @@ Boolean OSKextIsValid(OSKextRef aKext)
     return aKext->flags.valid ? true : false;
 }
 
-/*********************************************************************
-*********************************************************************/
-Boolean __OSKextAuthenticateURLRecursively(
+static Boolean __OSKextBasicFilesystemAuthenticationRecursive(
     OSKextRef aKext,
-    CFURLRef  anURL,
-    CFURLRef  pluginsURL)
+    CFURLRef anURL,
+    CFURLRef pluginsURL)
 {
     Boolean      result   = true;  // until we hit a bad one
     CFStringRef  filename = NULL;   // must release
@@ -12023,7 +13522,7 @@ Boolean __OSKextAuthenticateURLRecursively(
     count = CFArrayGetCount(urlContents);
     for (i = 0; i < count; i++) {
         CFURLRef thisURL = (CFURLRef)CFArrayGetValueAtIndex(urlContents, i);
-        result = __OSKextAuthenticateURLRecursively(aKext, thisURL, pluginsURL) && result;
+        result = __OSKextBasicFilesystemAuthenticationRecursive(aKext, thisURL, pluginsURL) && result;
     }
 
 finish:
@@ -12034,21 +13533,21 @@ finish:
 }
 
 /*********************************************************************
-*********************************************************************/
-Boolean OSKextAuthenticate(OSKextRef aKext)
+ * The default authentication function performs recursive URL validation
+ * of the entire bundle, without recursing into the pluginsURL. The actual
+ * validation is basic filesystem ownership and permission bits.
+ *********************************************************************/
+Boolean
+_OSKextBasicFilesystemAuthentication(OSKextRef aKext, __unused void *context)
 {
-    Boolean     result        = true;  // cleared when we hit an error
+    Boolean     result        = true;  // until we hit a bad one
     CFBundleRef kextBundle    = NULL;  // must release
     CFURLRef    pluginsURL    = NULL;  // must release
     CFURLRef    pluginsAbsURL = NULL;  // must release
 
-    aKext->flags.inauthentic = 0;
-    aKext->flags.authentic = 0;
-    aKext->flags.authenticated = 0;
-
     if (OSKextIsFromMkext(aKext)) {
         if (aKext->mkextInfo->mkextURL) {
-            result = __OSKextAuthenticateURLRecursively(aKext,
+            result = __OSKextBasicFilesystemAuthenticationRecursive(aKext,
                 aKext->mkextInfo->mkextURL, /* pluginsURL */ NULL);
             // xxx - need to look up all kexts from the mkext and mark them authenticated
         } else {
@@ -12074,24 +13573,67 @@ Boolean OSKextAuthenticate(OSKextRef aKext)
             }
         }
 
-        result = __OSKextAuthenticateURLRecursively(aKext, aKext->bundleURL,
+        result = __OSKextBasicFilesystemAuthenticationRecursive(aKext, aKext->bundleURL,
             pluginsAbsURL);
     }
 
 finish:
-
-   /*****
-    * All tests passed, yay.
-    */
-    if (result) {
-        aKext->flags.authentic = 1;
-        aKext->flags.authenticated = 1;
-    }
-
     SAFE_RELEASE(kextBundle);
     SAFE_RELEASE(pluginsURL);
     SAFE_RELEASE(pluginsAbsURL);
+    return result;
+}
 
+/*********************************************************************
+ * The actual authentication function can be controlled by the client
+ * using _OSKextSetAuthenticationFunction.   If so, that authentication
+ * function is called and its results are cached locally.  If no
+ * customized authentication function is provided, IOKit defaults to
+ * using the basic filesystem authentication check it has always performed.
+*********************************************************************/
+Boolean OSKextAuthenticate(OSKextRef aKext)
+{
+    Boolean     result        = true;
+    char        kextPath[PATH_MAX];
+
+    aKext->flags.inauthentic = 0;
+    aKext->flags.authentic = 0;
+    aKext->flags.authenticated = 0;
+    aKext->flags.rootless_trusted = 0;
+
+    if (__sOSKextAuthenticationFunction) {
+        if (!__OSKextGetFileSystemPath(aKext, NULL, true, kextPath)) {
+            OSKextLog(aKext,
+                kOSKextLogErrorLevel |
+                kOSKextLogGeneralFlag | kOSKextLogKextBookkeepingFlag,
+                "Could not get absolute path of kext!");
+            result = false;
+            goto finish;
+        }
+        if (rootless_check_trusted(kextPath) == 0) {
+            aKext->flags.rootless_trusted = 1;
+        }
+
+        result = __sOSKextAuthenticationFunction(aKext, __sOSKextAuthenticationContext);
+    } else {
+        // Setting a NULL authentication function means its not authenticated.
+        OSKextLog(/* kext */ NULL,
+            kOSKextLogErrorLevel | kOSKextLogValidationFlag,
+            "Trying to authenticate kext with no authentication function, failing.");
+        result = false;
+    }
+
+finish:
+   /*****
+    * Update to denote authentication has happened, and place its result in
+    * the appropriate bit.
+    */
+    aKext->flags.authenticated = 1;
+    if (result) {
+        aKext->flags.authentic = 1;
+    } else {
+        aKext->flags.inauthentic = 1;
+    }
     return result;
 }
 
@@ -12528,6 +14070,10 @@ void __OSKextAddDiagnostic(
         goto finish;
     }
 
+    if (!value) {
+        goto finish;
+    }
+
     diagnosticDict = __OSKextGetDiagnostics(aKext, type);
     if (!diagnosticDict) {
         goto finish;
@@ -12929,8 +14475,9 @@ Boolean __OSKextProcessInfoDictionary(
     CFDictionaryRef   dictValue           = NULL;   // do not release
     CFTypeRef         debugLevel          = NULL;   // do not release
     Boolean           isInterfaceSetFalse = false;
-    OSKextVersion     bundleVersion      = -1;
-    OSKextVersion     compatibleVersion  = -1;
+    CFStringRef       bundleType          = NULL;
+    OSKextVersion     bundleVersion       = -1;
+    OSKextVersion     compatibleVersion   = -1;
 
    /* Remove the kext from the lookup dictionary (if there). Its identifier or
     * version may change if we read the info dictionary from disk. This happens
@@ -12947,12 +14494,13 @@ Boolean __OSKextProcessInfoDictionary(
     */
     result = true;
 
-   /*********************************
-    * CFBundlePackageType == "KEXT" *
-    *********************************/
+   /**************************************
+    * CFBundlePackageType == "KEXT/DEXT" *
+    **************************************/
 
-   /* This check is somewhat pedantic, but it pretty much means
-    * the rest of the checks aren't worth doing.
+   /* CFBundlePackageType should match either KEXT or DEXT. In the latter
+    * case, mark the OSKext object as containing a userspace executable (we'll
+    * further validate this later on).
     */
     propKey = _kCFBundlePackageTypeKey;
     checkResult = __OSKextCheckProperty(aKext,
@@ -12964,10 +14512,10 @@ Boolean __OSKextProcessInfoDictionary(
         /* required */ true,
         /* typeRequired */ true,
         /* nonnilRequired */ true,
-        /* valueOut */ NULL,
-        /* valueIsNonnil */ NULL);
+        /* valueOut */ (CFTypeRef *)&bundleType,
+        /* valueIsNonnil */ &valueIsNonnil);
     result = result && checkResult;
-    if (!checkResult) {
+    if (!checkResult || !valueIsNonnil) {
         goto finish;
     }
 
@@ -13153,7 +14701,16 @@ Boolean __OSKextProcessInfoDictionary(
         &valueIsNonnil);
     result = result && checkResult;
     if (valueIsNonnil) {
-        aKext->flags.declaresExecutable = 1;
+        if (CFEqual(bundleType,
+                    __kOSKextBundlePackageTypeKext)) {
+            aKext->flags.declaresKernelExecutable = 1;
+        } else if (CFEqual(bundleType,
+                    __kOSKextBundlePackageTypeDriverKit)) {
+            aKext->flags.declaresUserExecutable = 1;
+        } else {
+            /* We should have validated this further up */
+            result = false;
+        }
     }
 
 #if SHARED_EXECUTABLE
@@ -13171,13 +14728,17 @@ Boolean __OSKextProcessInfoDictionary(
         &valueIsNonnil);
     result = result && checkResult;
    /* Can't have both executable and shared! */
-    if (aKext->flags.declaresExecutable) {
-        if (valueIsNonnil) {
+    if (valueIsNonnil) {
+        if (aKext->flags.declaresKernelExecutable) {
             __OSKextSetDiagnostic(aKext, kOSKextDiagnosticsFlagValidation,
                 kOSKextDiagnosticSharedExecutableAndExecutableKey);
+        } else if (aKext->flags.declaresUserExecutable) {
+            __OSKextSetDiagnostic(aKext, kOSKextDiagnosticsFlagValidation,
+                kOSKextDiagnosticUserExecutableAndExecutableKey);
+            result = false;
+        } else {
+            aKext->flags.declaresKernelExecutable = 1;
         }
-    } else if (valueIsNonnil) {
-        aKext->flags.declaresExecutable = 1;
     }
 #endif /* SHARED_EXECUBTABLE */
 
@@ -13233,15 +14794,66 @@ Boolean __OSKextProcessInfoDictionary(
         /* required */ false,
         /* typeRequired */ true,
         /* nonnilRequired */ false,  // required values given
-        /* valueOut */ NULL,
+        /* valueOut */ (CFTypeRef *)&stringValue,
         &valueIsNonnil);
     result = result && checkResult;
     if (valueIsNonnil) {
-        aKext->flags.isLoadableInSafeBoot = 1;
+        /*
+         * First-party driver extensions may use the OSBundleRequired key, and
+         * can be loadable in safe boot. Certain extensions with the "DriverKit"
+         * value can also have their properties included in the kernel to match
+         * on devices normally provided by kexts. Kexts aren't allowed to use
+         * this value.
+         */
+        if (aKext->flags.declaresUserExecutable) {
+            if (!_OSKextIdentifierHasApplePrefix(aKext)) {
+                __OSKextSetDiagnostic(aKext, kOSKextDiagnosticsFlagBootLevel,
+                    kOSKextDiagnosticThirdPartiesIneligibleForDriverKitOSBundleRequired);
+                result = false;
+            } else if (!(CFEqual(stringValue, CFSTR(kOSBundleRequiredDriverKit)) ||
+                         CFEqual(stringValue, CFSTR(kOSBundleRequiredSafeBoot)))) {
+                __OSKextSetDiagnostic(aKext, kOSKextDiagnosticsFlagBootLevel,
+                    kOSKextDiagnosticOSBundleRequiredValueIneligibleForDriverKit);
+                result = false;
+            }
+        } else { // !declaresUserExecutable
+            if (CFEqual(stringValue, CFSTR(kOSBundleRequiredDriverKit))) {
+                __OSKextSetDiagnostic(aKext, kOSKextDiagnosticsFlagBootLevel,
+                    kOSKextDiagnosticKextIneligibleForDriverKit);
+                result = false;
+            }
+        }
+
+        aKext->flags.isLoadableInSafeBoot = result ? 1 : 0;
     } else {
         if (OSKextGetActualSafeBoot() || OSKextGetSimulatedSafeBoot()) {
             __OSKextSetDiagnostic(aKext, kOSKextDiagnosticsFlagBootLevel,
                 kOSKextDiagnosticIneligibleInSafeBoot);
+        }
+    }
+
+    /* Certain keys aren't legal for driver extensions (kexts only). */
+    if (aKext->flags.declaresUserExecutable) {
+        CFIndex numKeys = CFArrayGetCount(__sOSKextInfoKextOnlyKeys);
+        for (CFIndex i = 0; i < numKeys; i++) {
+            propKey = CFArrayGetValueAtIndex(__sOSKextInfoKextOnlyKeys, i);
+            if (OSKextGetValueForInfoDictionaryKey(aKext, propKey)) {
+                result = false;
+
+                CFStringRef diagnostic = CFStringCreateWithFormat(kCFAllocatorDefault,
+                        NULL, kOSKextDiagnosticInfoKeyIneligibleForDriverKit, propKey);
+                if (!diagnostic) {
+                    OSKextLogStringError(aKext);
+                    goto finish;
+                }
+
+                __OSKextSetDiagnostic(aKext, kOSKextDiagnosticsFlagValidation,
+                        diagnostic);
+
+                SAFE_RELEASE(diagnostic);
+                /* Deliberately don't break here, so we can get diagnostics for
+                 * the developer containing all of the bad keys at once */
+            }
         }
     }
 
@@ -13339,6 +14951,7 @@ Boolean OSKextMatchesRequiredFlags(OSKextRef aKext,
         REQUIRED_MATCH(requiredFlags, requiredString, LocalRoot) ||
         REQUIRED_MATCH(requiredFlags, requiredString, NetworkRoot) ||
         REQUIRED_MATCH(requiredFlags, requiredString, Console) ||
+        REQUIRED_MATCH(requiredFlags, requiredString, DriverKit) ||
         REQUIRED_MATCH(requiredFlags, requiredString, SafeBoot)) {
 
         result = true;
@@ -13547,6 +15160,12 @@ Boolean __OSKextAddToMkext(
     __OSKextGetFileSystemPath(aKext, /* otherURL */ NULL,
         /* resolveToBase */ true, kextPath);
 
+    if (!__sOSKextLoadAuditFunction(aKext)) {
+        OSKextLog(aKext, kOSKextLogErrorLevel | kOSKextLogLoadFlag,
+             "Load audit function returned false, bailing on adding %s to mkext.", kextPath);
+        goto finish;
+    }
+
     OSKextLog(aKext, kOSKextLogStepLevel | kOSKextLogArchiveFlag,
         "Adding %s to mkext.", kextPath);
 
@@ -13555,6 +15174,26 @@ Boolean __OSKextAddToMkext(
         OSKextLog(aKext, kOSKextLogErrorLevel | kOSKextLogArchiveFlag,
             "Can't get info dictionary for %s.", kextPath);
         goto finish;
+    }
+
+    /*
+     * If this is a KASan kext, implicitly link against the KASan bundle.
+     * We've done this already in __OSKextResolveDependencies, but we have
+     * to add the dependency to the kext's Info.plist that's sent to the kernel.
+     */
+    if (OSKextDeclaresExecutable(aKext) && __OSKextHasSuffix(aKext, "_kasan") && !OSKextIsKernelComponent(aKext)) {
+        CFMutableDictionaryRef depsDict = (CFMutableDictionaryRef) OSKextGetValueForInfoDictionaryKey(
+            aKext, CFSTR(kOSBundleLibrariesKey));
+        if (depsDict) {
+            CFStringRef kasanVer = (CFStringRef)CFDictionaryGetValue(depsDict, __kOSKextKasanKPI);
+            if (!kasanVer) {
+                CFDictionarySetValue(depsDict, __kOSKextKasanKPI, __kOSKextKasanKPIVersion);
+            }
+        } else {
+            OSKextLog(aKext, kOSKextLogErrorLevel | kOSKextLogArchiveFlag,
+                "Executable kext %s with no dependencies?!", kextPath);
+            goto finish;
+        }
     }
 
    /* If the kext has logging enabled, whether originally in the plist
@@ -13578,12 +15217,6 @@ Boolean __OSKextAddToMkext(
 
     if (executable) {
         uint32_t entryFileSize;
-
-       /* Advise the system that we're reading the executable sequentially.
-        */
-        (void)posix_madvise((void *)CFDataGetBytePtr(executable),
-            CFDataGetLength(executable),
-            POSIX_MADV_SEQUENTIAL);
 
         mkextEntryOffset = mkextDataStartLength;
         mkextEntryOffsetNum = CFNumberCreate(CFGetAllocator(aKext),
@@ -13651,14 +15284,6 @@ Boolean __OSKextAddToMkext(
 finish:
     if (!result) {
         CFDataSetLength(mkextData, mkextDataStartLength);
-    }
-
-   /* Advise the system that we no longer need the mmapped executable.
-    */
-    if (executable) {
-        (void)posix_madvise((void *)CFDataGetBytePtr(executable),
-            CFDataGetLength(executable),
-            POSIX_MADV_DONTNEED);
     }
 
     SAFE_RELEASE(infoDictionary);
@@ -14336,17 +15961,1396 @@ static boolean_t __OSKextGetLastKernelLoadAddr(
 }
 
 /*********************************************************************
+ *********************************************************************/
+static boolean_t __OSKextSetLinkInfo(
+    OSKextRef       aKext,
+    plkInfo *       plkInfo,
+    CFDataRef       kextExecutable)
+{
+    boolean_t                   result = false;
+    boolean_t                   swapped = false;
+    boolean_t                   isSplitKext = false;
+    struct mach_header_64 *     kextHeader;
+    uint32_t                    maxAlign;
+    uint64_t                    next_vmaddr;
+
+    if (!__OSKextCreateLoadInfo(aKext)) {
+        goto finish;
+    }
+
+    {
+        char *kextID = NULL;
+        kextID = createUTF8CStringForCFString(aKext->bundleID);
+        kcgen_verboseLog("processing %s", kextID);
+        SAFE_FREE(kextID);
+    }
+
+    kextHeader = (struct mach_header_64 *)CFDataGetBytePtr(kextExecutable);
+    isSplitKext = __OSKextIsSplitKextMacho64(kextHeader);
+
+    swapped = __OSKextSwapHeaders(kextExecutable);
+    
+    /* TODO: refactor special case for interace kext */
+    if (OSKextIsInterface(aKext)) {
+        // NOTE - interface kexts only have __LINKEDIT segment. There is
+        // only a macho header, load commands and the __LINKEDIT data so we
+        // hang this off the __PRELINK_TEXT segment.
+        // __LINKEDIT doesn't have alignment info so take a best guess.
+        maxAlign = KEXT_MIN_ALIGN;
+
+        aKext->loadInfo->linkedExecutable = CFRetain(kextExecutable);
+        aKext->loadInfo->prelinkedExecutable = CFRetain(kextExecutable);
+        aKext->loadInfo->linkInfo.linkedKext = (u_char *) CFDataGetBytePtr(kextExecutable);
+        aKext->loadInfo->linkInfo.linkedKextSize = CFDataGetLength(kextExecutable);
+    
+        next_vmaddr = __OSKextAlignAddress(getKCPlkSegNextVMAddr(plkInfo, SEG_IDX_TEXT), maxAlign);
+        aKext->loadInfo->linkInfo.vmaddr_TEXT = next_vmaddr;
+
+        if (nSplitKexts) {
+            setKCPlkSegNextVMAddr(plkInfo, SEG_IDX_TEXT, next_vmaddr + sizeof(kextHeader) + kextHeader->sizeofcmds);
+        } else {
+            setKCPlkSegNextVMAddr(plkInfo, SEG_IDX_TEXT, next_vmaddr + roundPageCrossSafe(aKext->loadInfo->linkInfo.linkedKextSize));
+        }
+
+        result = true;
+        goto finish;
+    } // interface kext
+
+    aKext->loadInfo->linkInfo.kextExecutable = (u_char *) CFDataGetBytePtr(kextExecutable);
+    aKext->loadInfo->linkInfo.kextSize = CFDataGetLength(kextExecutable);
+
+    /* special case for non split kexts */
+    if (!nSplitKexts) {
+        uint64_t vmaddr;
+        vmaddr = getKCPlkSegNextVMAddr(plkInfo, SEG_IDX_TEXT);
+        setKextVMAddr(aKext, SEG_IDX_TEXT, vmaddr);
+        result = true;
+        goto finish;
+    }
+
+    /* set target VM addr and save original VM addr for all segments in this kext */
+
+    for(enum enumSegIdx segIndex = SEG_IDX_TEXT; segIndex < SEG_IDX_COUNT; segIndex++) {
+        uint64_t my_vmaddr, my_vmsize, my_fileoff, my_filesize, my_maxalign, next_vmaddr;
+        char *segName = segIdxToName(segIndex);
+
+        result = __OSKextGetSegmentInfo(aKext->loadInfo->linkInfo.kextExecutable, segName, &my_vmaddr, &my_vmsize, &my_fileoff, &my_filesize, &my_maxalign, true);
+
+        if (result == false)
+            continue;
+
+        kcgen_verboseLog("segName %s vmaddr %llx vmsize %llx fileoff %llx filesize %llx maxalign %llx", segName, my_vmaddr, my_vmsize, my_fileoff, my_filesize, my_maxalign);
+        /* not true for LINKEDIT */
+        //assert(my_vmsize == my_filesize);
+
+        {
+            assert(__OSKextIsArchitectureLP64());
+            struct segment_command_64 *seg = macho_get_segment_by_name_64(kextHeader, segName);
+            assert(seg);
+
+            seg->vmsize = my_vmsize;
+            seg->filesize = my_filesize;
+        }
+
+        // FIXME: impedence mismatch with plkInfo structure!
+        next_vmaddr = __OSKextAlignAddress(getKCPlkSegNextVMAddr(plkInfo, segIndex), my_maxalign);
+        kcgen_verboseLog("segName %s new vmaddr %llx", segName, next_vmaddr);
+
+        setKextVMAddr(aKext, segIndex, next_vmaddr);
+
+        setKCPlkSegNextVMAddr(plkInfo, segIndex, next_vmaddr + my_vmsize);
+    }
+
+    if (__OSKextValidatePLKInfo(aKext, kextHeader, plkInfo) == false) {
+        abort();
+        goto finish;
+    }
+
+    result = true;
+
+finish:
+    if (swapped) {
+        __OSKextUnswapHeaders(kextExecutable);
+    }
+
+    return result;
+}
+
+/*********************************************************************
+ *********************************************************************/
+static boolean_t __OSKextValidatePLKInfo(
+    OSKextRef              aKext,
+    struct mach_header_64 *kextHeader,
+    plkInfo               *plkInfo )
+{
+    boolean_t       result = true;
+    boolean_t       isSplitKext = false;
+    plkSegInfo     *plkSeg[SEG_IDX_COUNT] = { NULL };
+    char            kextPath[PATH_MAX];
+
+    __OSKextGetFileSystemPath(aKext, NULL, true, kextPath);
+
+    isSplitKext = __OSKextIsSplitKextMacho64(kextHeader);
+
+    plkSeg[SEG_IDX_TEXT] = &plkInfo->plk_TEXT;
+    if (isSplitKext) {
+        plkSeg[SEG_IDX_TEXT_EXEC]  = &plkInfo->plk_TEXT_EXEC;
+        plkSeg[SEG_IDX_DATA]       = &plkInfo->plk_DATA;
+        plkSeg[SEG_IDX_DATA_CONST] = &plkInfo->plk_DATA_CONST;
+        plkSeg[SEG_IDX_LINKEDIT]   = &plkInfo->plk_LINKEDIT;
+        plkSeg[SEG_IDX_LLVM_COV]   = &plkInfo->plk_LLVM_COV;
+    }
+
+    for (size_t i = 0; i < sizeof(plkSeg)/sizeof(plkSeg[0]); i++) {
+        if (!plkSeg[i])
+            break;
+
+        SegInfo *segInfo = &plkSeg[i]->plkSegInfo;
+        uint64_t seg_vmoff = plkSeg[i]->plk_next_kext_vmaddr - segInfo->vmaddr;
+        uint64_t seg_fileoff = segInfo->fileoff + seg_vmoff;
+        if (segInfo->vmaddr > plkSeg[i]->plk_next_kext_vmaddr) {
+            OSKextLog(aKext, kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                      "%s vmaddr %p larger than plk_next_kext_vmaddr %p for %s",
+                      plkSeg[i]->plk_seg_name,
+                      (void *)segInfo->vmaddr,
+                      (void *)plkSeg[i]->plk_next_kext_vmaddr,
+                      kextPath);
+            result = false;
+        }
+        if (segInfo->vmaddr + segInfo->vmsize < plkSeg[i]->plk_next_kext_vmaddr) {
+            OSKextLog(aKext, kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                      "%s overflow! plk_next_kext_vmaddr %p past end of segment %p for %s",
+                      plkSeg[i]->plk_seg_name,
+                      (void *)plkSeg[i]->plk_next_kext_vmaddr,
+                      (void *)(segInfo->vmaddr + segInfo->vmsize),
+                      kextPath);
+            result = false;
+        }
+        if (segInfo->fileoff > seg_fileoff) {
+            OSKextLog(aKext, kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                      "%s fileoff %llu larger than plk_next_kext_fileoff %llu for %s",
+                      plkSeg[i]->plk_seg_name,
+                      segInfo->fileoff,
+                      seg_fileoff,
+                      kextPath);
+            result = false;
+        }
+        if (segInfo->fileoff + segInfo->vmsize < seg_fileoff) {
+            OSKextLog(aKext, kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                      "%s overflow! plk_next_kext_fileoff %llu past end of segment %llu for %s",
+                      plkSeg[i]->plk_seg_name,
+                      seg_fileoff,
+                      (segInfo->fileoff + segInfo->vmsize),
+                      kextPath);
+            result = false;
+        }
+        if (result == false) {
+            __OSKextShowPLKInfo(plkInfo);
+            break;
+        }
+    }
+
+    return result;
+}
+
+static boolean_t __OSKextOldCopyToPLK(OSKextRef aKext, plkInfo *plkInfo, Boolean stripSymbolsFlag __unused) {
+    uint64_t vmsize;
+    u_char *prelinkData = CFDataGetMutableBytePtr(plkInfo->kernelCacheImage);
+    CFIndex prelinkDataSize = CFDataGetLength(plkInfo->kernelCacheImage);
+    
+    uint64_t plkSegVMBase = plkInfo->plk_TEXT.plkSegInfo.vmaddr;
+    uint64_t plkSegFileBase = plkInfo->plk_TEXT.plkSegInfo.fileoff;
+    
+    uint64_t vmoff = aKext->loadInfo->linkInfo.vmaddr_TEXT - plkSegVMBase;
+    uint64_t fileoff = plkSegFileBase + vmoff;
+    
+    vmsize = aKext->loadInfo->linkInfo.linkedKextSize;
+
+    if (OSKextIsInterface(aKext)) {
+        memcpy(prelinkData + fileoff,
+                aKext->loadInfo->linkInfo.linkedKext,
+                vmsize); 
+        return true;
+    }
+
+    if (stripSymbolsFlag) {
+        aKext->loadInfo->prelinkedExecutable = __OSKextCopyStrippedExecutable(aKext);
+
+        if (aKext->loadInfo->prelinkedExecutable == NULL) {
+            char tempStr[1024];
+
+            CFStringGetCString(aKext->bundleID, tempStr, sizeof(tempStr),
+                               kCFStringEncodingUTF8);
+            OSKextLog(aKext, kOSKextLogErrorLevel | kOSKextLogLinkFlag,
+                      "Can't strip executable for %s <%s>", tempStr, __func__);
+            aKext->loadInfo->prelinkedExecutable = CFRetain(aKext->loadInfo->linkedExecutable);
+        } else {
+            aKext->loadInfo->linkInfo.linkedKextSize = CFDataGetLength(aKext->loadInfo->prelinkedExecutable);
+            aKext->loadInfo->linkInfo.linkedKext = (u_char *)CFDataGetBytePtr(aKext->loadInfo->prelinkedExecutable);
+
+            // 03/16/12 - <rdar://problem/10980607>
+            // must update the kmod_info.size field embedded within the kext image
+            {
+                u_char *file = (u_char *) CFDataGetMutableBytePtr((CFMutableDataRef) aKext->loadInfo->prelinkedExecutable);
+                Boolean is_32bit_kext = ((struct mach_header *) file)->magic == MH_MAGIC;
+                u_int64_t kmodInfo_offset = aKext->loadInfo->kmodInfoAddress - aKext->loadInfo->linkInfo.vmaddr_TEXT;
+                vm_size_t *size_field = (vm_size_t *) (is_32bit_kext ? 
+                                                    (file + kmodInfo_offset + offsetof(kmod_info_32_v1_t, size)) :
+                                                    (file + kmodInfo_offset + offsetof(kmod_info_64_v1_t, size)));
+                *size_field = aKext->loadInfo->linkInfo.linkedKextSize;
+            }
+        }
+    }
+
+
+    if (!aKext->loadInfo->prelinkedExecutable) {
+        aKext->loadInfo->prelinkedExecutable = CFRetain(aKext->loadInfo->linkedExecutable);
+    }
+
+    vmsize = roundPageCrossSafe(aKext->loadInfo->linkInfo.linkedKextSize);
+
+    if (fileoff + vmsize > (uint64_t) prelinkDataSize) {
+        OSKextLog(NULL,
+                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                  "%s %d - overflow !!! plk_TEXT.plk_next_kext_fileoff %llu + vmsize %llu > prelinkDataSize %ld ",
+                  __func__, __LINE__,
+                  fileoff,
+                  vmsize,
+                  prelinkDataSize);
+       return false;
+    }
+
+    if (vmoff + vmsize > plkInfo->plk_TEXT.plkSegInfo.vmsize) {
+        OSKextLog(NULL,
+                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                  "%s %d - overflow !!! vmsize %llu > plk_TEXT.plkSegInfo.filesize  %llu ",
+                  __func__, __LINE__,
+                  vmsize,
+                  plkInfo->plk_TEXT.plkSegInfo.vmsize);
+       return false;
+    }
+
+    kcgen_verboseLog("copying to fileoff %llu sz %llu", fileoff, vmsize);
+
+    memcpy(prelinkData + fileoff,
+           aKext->loadInfo->linkInfo.linkedKext,
+           vmsize);
+
+    plkInfo->plk_TEXT.plk_next_kext_vmaddr  += vmsize;
+
+    return true;
+}
+
+
+/*
+ * Reset all LINKEDIT related load commands in a macho header.
+ * NOTE: this does not free any memory associated with the macho, it only
+ *       updates book keeping in the header.
+ */
+static void __OSKextStripMachHeader64(struct mach_header_64 *mh, uint64_t le_fileoff)
+{
+    struct segment_command_64 * le_seg;
+    struct section_64 *sect;
+
+    le_seg = macho_get_segment_by_name_64(mh, SEG_LINKEDIT);
+    if (NULL == le_seg)
+        return;
+
+    le_seg->fileoff = le_fileoff;
+    le_seg->filesize = 0;
+    le_seg->vmsize = 0;
+    /* there shouldn't be any sections in the LINKEDIT segment, but just in case... */
+    if (le_seg->nsects > 0) {
+        sect = (struct section_64 *)(&le_seg[1]);
+        for (uint32_t j = 0; j < le_seg->nsects; ++j, ++sect) {
+            sect->addr = le_seg->vmaddr;
+            sect->size = 0;
+            sect->offset = le_seg->fileoff;
+            sect->reloff = sect->nreloc = 0;
+        }
+    }
+
+    /* now we have to loop over all the other load commands and look for linker-related commands */
+    size_t offset = sizeof(*mh);
+    for (unsigned i = 0; i < mh->ncmds; ++i) {
+        struct load_command *lc = (struct load_command *)((char *)mh + offset);
+        switch (lc->cmd) {
+        case LC_SYMTAB: {
+            struct symtab_command *symtab = (struct symtab_command *)lc;
+            symtab->symoff = symtab->nsyms = symtab->stroff = symtab->strsize = 0;
+            } break;
+        case LC_DYSYMTAB: {
+            struct dysymtab_command *dstab= (struct dysymtab_command *)lc;
+            dstab->ilocalsym = dstab->nlocalsym = 0;
+            dstab->iextdefsym = dstab->nextdefsym =0;
+            dstab->iundefsym = dstab->nundefsym = 0;
+            dstab->tocoff = dstab->ntoc = 0;
+            dstab->modtaboff = dstab->nmodtab = 0;
+            dstab->extrefsymoff = dstab->nextrefsyms = 0;
+            dstab->indirectsymoff = dstab->nindirectsyms = 0;
+            dstab->extreloff = dstab->nextrel = 0;
+            dstab->locreloff = dstab->nlocrel = 0;
+            } break;
+        case LC_SEGMENT_SPLIT_INFO: {
+            struct linkedit_data_command *ldc = (struct linkedit_data_command *)lc;
+            ldc->dataoff = ldc->datasize = 0;
+            } break;
+        case LC_SEGMENT_64: {
+            struct segment_command_64 *seg = (struct segment_command_64 *)lc;
+            sect = (struct section_64 *)(&seg[1]);
+            for (uint32_t j = 0; j < seg->nsects; ++j, ++sect) {
+                sect->reloff = sect->nreloc = 0;
+            }
+            } break;
+        default:
+            break;
+        }
+        offset += lc->cmdsize;
+    } // for each load command
+
+    return;
+}
+
+static boolean_t __OSKextCopyToPLK(OSKextRef aKext,
+                                   plkInfo *plkInfo,
+                                   u_char *prelinkData,
+                                   uint64_t prelinkDataSize,
+                                   uint64_t *in_orig_vmaddrs,
+                                   uint64_t *in_new_vmaddrs,
+                                   uint64_t *in_kc_offs,
+                                   uint64_t *out_sizes,
+                                   Boolean stripSymbolsFlag)
+{
+    boolean_t isSplitKext;
+    struct mach_header_64 *mh;
+    splitKextLinkInfo *linkInfo;
+    uint32_t mh_size, mh_size_round;
+    int result;
+
+    uint64_t segCacheFileOffsets[SEG_IDX_COUNT];
+    uint64_t segCacheFileSizes[SEG_IDX_COUNT];
+    uint64_t segOrigStartAddresses[SEG_IDX_COUNT];
+    uint64_t segNewStartAddresses[SEG_IDX_COUNT];
+
+    uint64_t segKCOffsets[SEG_IDX_COUNT];
+    uintptr_t *pointersForASLR = NULL;
+    size_t numPointers = 0;
+    unsigned int adjustSegment;
+
+    if (!aKext || !in_kc_offs || !in_new_vmaddrs)
+        return false;
+
+    /*
+     * we have to continue checking for isSplitKext here because
+     * of interface kexts such as com.apple.kpi.mach
+     */
+    isSplitKext = __OSKextIsSplitKext(aKext);
+    linkInfo = &aKext->loadInfo->linkInfo;
+
+    /* debug info */
+#if SPLIT_KEXTS_DEBUG
+    char kextPath[PATH_MAX];
+    __OSKextGetFileSystemPath(aKext, NULL, false, kextPath);
+    __OSKextShowMachoHeader(linkInfo->linkedKext, linkInfo->linkedKextSize);
+#endif
+
+    mh = (struct mach_header_64 *)linkInfo->linkedKext;
+
+    /* special case for interface kext? */
+    if (OSKextIsInterface(aKext)) {
+        mh_size = sizeof(struct mach_header_64) + mh->sizeofcmds;
+        mh_size_round = __OSKextAlignAddress(mh_size, 6); 
+        memcpy(prelinkData + in_kc_offs[SEG_IDX_TEXT], linkInfo->linkedKext, mh_size_round);
+
+        out_sizes[SEG_IDX_TEXT] = mh_size_round;
+        goto finish;
+    }
+
+    /* special case for isSplitKext? */
+    if (isSplitKext) {
+        /* TODO: what will fail if kext doesn't have all segments? */
+        __OSKextMachOSetSegmentProtection(mh, SEG_TEXT, PROT_READ, PROT_READ);
+        __OSKextMachOSetSegmentProtection(mh, SEG_TEXT_EXEC, PROT_READ | PROT_EXEC, PROT_READ | PROT_EXEC);
+        __OSKextMachOSetSegmentProtection(mh, SEG_DATA, PROT_READ | PROT_WRITE, PROT_READ | PROT_WRITE);
+        __OSKextMachOSetSegmentProtection(mh, SEG_DATA_CONST, PROT_READ, PROT_READ);
+        __OSKextMachOSetSegmentProtection(mh, SEG_LLVM_COV, PROT_READ, PROT_READ | PROT_WRITE);
+        __OSKextMachOSetSegmentProtection(mh, SEG_LINKEDIT, PROT_READ, PROT_READ);
+    }
+
+    /* adjustSegment is a count of how many segments we actually find. we don't expect more than SEG_IDX_COUNT */
+    adjustSegment = 0;
+
+    /*
+     * Copy each segment we find into the kernel cache at the offset specified
+     * by the in_kc_offs[] array.
+     */
+    for (unsigned int segIndex = 0; segIndex < SEG_IDX_COUNT; segIndex++) {
+        uint64_t my_vmaddr, my_vmsize, my_fileoff, my_filesize, my_maxalign;
+        uint64_t segEnd;
+        char *segName;
+
+        /* always keep the KC offset for _each_ segment for KASLR processing */
+        segKCOffsets[segIndex] = in_kc_offs[segIndex];
+
+        /* keep the KC offset/VM addr of segments that need adjusting */
+        segCacheFileOffsets[adjustSegment] = in_kc_offs[segIndex];
+        segOrigStartAddresses[adjustSegment] = in_orig_vmaddrs[segIndex];
+        segNewStartAddresses[adjustSegment] = in_new_vmaddrs[segIndex];
+
+        segName = segIdxToName(segIndex);
+        assert(segName);
+
+        result = __OSKextGetSegmentInfo(linkInfo->linkedKext, segName, &my_vmaddr, &my_vmsize, &my_fileoff, &my_filesize, &my_maxalign, true);
+
+        if (result == false) {
+            /* not all kexts will have all segments, e.g., __LLVM_COV */
+            kcgen_verboseLog("Kext doesn't contain '%s' segment: skipping.", segName);
+            continue;
+        }
+
+        assert(my_vmsize == my_filesize);
+
+        if (!isSplitKext) {
+            /* special case for old style kext */
+            my_vmsize = linkInfo->linkedKextSize;
+            my_filesize = my_vmsize;
+        }
+
+        segEnd = in_kc_offs[segIndex] + my_filesize;
+        assert(segEnd < prelinkDataSize);
+
+        kcgen_verboseLog("segName %s kc_off %llx vmaddr %llx vmsize %llx fileoff %llx filesize %llx",
+                         segName, in_kc_offs[segIndex], my_vmaddr, my_vmsize, my_fileoff, my_filesize);
+
+        kcgen_verboseLog("memcpy(%llx, %llx, %llx)", (uintptr_t)prelinkData + in_kc_offs[segIndex], (uintptr_t)linkInfo->linkedKext + my_fileoff, my_filesize);
+        // my_fileoff and my_filesize are the offset and size of the kext TEXT segment at this point
+        assert((my_fileoff + my_filesize) < linkInfo->linkedKextSize);
+        memcpy(prelinkData + in_kc_offs[segIndex], linkInfo->linkedKext + my_fileoff, my_filesize);
+
+
+        // update seg filesize input vector for segment Adjustor
+        segCacheFileSizes[adjustSegment] = my_filesize;
+
+        if (out_sizes) 
+            out_sizes[segIndex] = my_vmsize;
+        adjustSegment++;
+    }
+
+    if (isSplitKext) {
+        /* adjust intra-kext relocations */
+        kcgen_verboseLog("Adjusting intra-kext relocations...");
+        result = kcgen_adjustKextSegmentLocations(OSKextGetArchitecture()->cputype,
+                                         OSKextGetArchitecture()->cpusubtype,
+                                         prelinkData,
+                                         adjustSegment,
+                                         segCacheFileOffsets,
+                                         segCacheFileSizes,
+                                         segOrigStartAddresses,
+                                         segNewStartAddresses,
+                                         &pointersForASLR,
+                                         &numPointers);
+        if (result != 0) {
+            OSKextLog(aKext,
+                      kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                      "kcgen_adjustKextSegmentLocations failed with %d (%x) <%s %d>",
+                      result, result, __func__, __LINE__);
+            abort();
+        }
+
+        /* handle any/all relocations that need to slide with ASLR */
+        if (!__OSKextHandlePointersForASLR(aKext, plkInfo, prelinkData, segKCOffsets, pointersForASLR, numPointers)) {
+            char kextPath[PATH_MAX];
+            __OSKextGetFileSystemPath(aKext, NULL, false, kextPath);
+            OSKextLog(aKext,
+                      kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                      "Couldn't handle slide info for %s (KC most likely won't boot)!", kextPath);
+        }
+        pointersForASLR = NULL;
+        numPointers = 0;
+
+        /*
+         * We shouldn't keep all of the linkedKext memory around when we have
+         * a perfectly good copy of it in the kernel cache, and all we need is the symbol information. Convert the
+         * linked kext into an interface style kext.
+         */
+        if (!__OSKextCompactKext(aKext)) {
+            char kextPath[PATH_MAX];
+            __OSKextGetFileSystemPath(aKext, NULL, false, kextPath);
+            kcgen_verboseLog("Couldn't release kext memory for %s!", kextPath);
+        }
+
+        if (stripSymbolsFlag) {
+            struct mach_header_64 *kc_mh;
+            uint64_t le_fileoff;
+            /*
+             * We will be removing the PLK_LINKEDIT segment entirely:
+             * clear out the kext's LINKEDIT load command in the prelinked kernel cache.
+             * We have to leave the LINKEDIT data around the "linkedKext" pointer in
+             * order to properly link all the reset of the kexts.
+             */
+            kc_mh = (struct mach_header_64 *)(prelinkData + segKCOffsets[SEG_IDX_TEXT]);
+            le_fileoff = getKCPlkSegFileOff(plkInfo, SEG_IDX_LINKEDIT);
+            kcgen_verboseLog("\tStripping symbols from kext header...");
+            __OSKextStripMachHeader64(kc_mh, le_fileoff);
+        } // if (stripSymbolsFlag)
+    } // isSplitKext
+
+finish:
+    return true;
+}
+
+
+/*********************************************************************
+ * Routine to convert an offset into the kernel cache file into an
+ * offset into the prelink __TEXT segment.
+ *********************************************************************/
+static uint32_t kextcacheFileOffsetToPLKTEXTOffset(
+                uint64_t        kcOffset,
+                plkInfo *       plkInfo)
+{
+    uint64_t        plkSegOffset = 0;
+    uint64_t        plkSegVMAddr = 0;
+    uint32_t        plkTextOffset = 0;
+
+    for (unsigned int segIndex = 0; segIndex < SEG_IDX_COUNT; segIndex++) {
+        uint64_t plkseg_fileoff = getKCPlkSegFileOff(plkInfo, segIndex);
+        uint64_t plkseg_size    = getKCPlkSegVMSize(plkInfo, segIndex);
+        if (kcOffset >= plkseg_fileoff && kcOffset < plkseg_fileoff + plkseg_size) {
+            plkSegOffset = kcOffset - plkseg_fileoff;
+            plkSegVMAddr = getKCPlkSegVMAddr(plkInfo, segIndex);
+            break;
+        }
+    }
+
+    if (plkSegOffset == 0) {
+        kcgen_verboseLog("plkSegOffset:%lld (VMAddr:0x%llx) from kcOffset:%lld", plkSegOffset, plkSegVMAddr, kcOffset);
+    }
+    assert(plkSegVMAddr > 0);
+
+    plkTextOffset = (uint32_t)((plkSegVMAddr - getKCPlkSegVMAddr(plkInfo, SEG_IDX_TEXT)) + plkSegOffset);
+    return plkTextOffset;
+}
+
+
+/*********************************************************************
+ *********************************************************************/
+static boolean_t __OSKextInit_plkInfo(
+    CFDataRef       kernelImage,
+    CFArrayRef      kextArray,
+    plkInfo *       plkInfo )
+{
+    boolean_t               result         = false;
+    const UInt8 *           kernelImagePtr = CFDataGetBytePtr(kernelImage);
+    uint64_t                next_vmaddr;
+    uint64_t                next_fileoff;
+    struct SegInfo *        mySegInfo;
+    struct mach_header_64 * kernelHeader;
+    struct segment_command_64 * seg_cmd;
+
+    bzero((UInt8 *)plkInfo, sizeof(*plkInfo));
+
+    if (ISMACHO64(MAGIC32(kernelImagePtr)) == false) {
+        goto finish;
+    }
+
+    kernelHeader = (struct mach_header_64 *)kernelImagePtr;
+
+    // create CFSet to hold kaslr offsets we will need to slide
+    plkInfo->kaslrOffsets = CFSetCreateMutable(kCFAllocatorDefault, 0, &kCFTypeSetCallBacks);
+    if (plkInfo->kaslrOffsets == NULL) {
+        OSKextLogMemError();
+        goto finish;
+    }
+
+    // calculate size of the __PRELINK segments
+    if (kextArray) {
+        if (__OSKextGetPLKSegSizes(kextArray, plkInfo) == false) {
+            OSKextLog(/* kext */ NULL,
+                      kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                      "%s %d - __OSKextGetPLKSegSizes failed ",
+                      __func__, __LINE__);
+            goto finish;
+        }
+    }
+    
+    /* set size of kernel cache xnu text segment */
+    plkInfo->kernelImage = kernelImage;
+    next_fileoff = roundPageCrossSafe(CFDataGetLength(kernelImage));
+    seg_cmd = macho_get_segment_by_name_64(kernelHeader, SEG_TEXT);
+    if (NULL == seg_cmd) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                  "%s %d - could not find kernel __TEXT ",
+                  __func__, __LINE__);
+        goto finish;
+    }
+    mySegInfo = &plkInfo->kernel_TEXT;
+    mySegInfo->vmaddr = seg_cmd->vmaddr;
+    mySegInfo->vmsize = next_fileoff;
+    mySegInfo->fileoff = seg_cmd->fileoff;
+   
+#if SPLIT_KEXTS_DEBUG
+    kcgen_verboseLog("kernel __TEXT vmaddr %p to %p vmsize %llu fileoff %llu to %llu filesize %llu",
+                     (void *)mySegInfo->vmaddr,
+                     (void *) (mySegInfo->vmaddr + mySegInfo->vmsize),
+                     mySegInfo->vmsize,
+                     mySegInfo->fileoff,
+                     (mySegInfo->fileoff + mySegInfo->vmsize),
+                     mySegInfo->vmsize);
+#endif
+
+    // We want to compress the gap between __PRELINK_TEXT, __PLK_TEXT_EXEC, and __PLK_DATA_CONST
+    // with kernel __TEXT.  Take the sizes of __PRELINK_TEXT, __PLK_TEXT_EXEC, and __PLK_DATA_CONST
+    // and subtract that from kernel_TEXT vmaddr to get our new start vmaddr.
+    // We also need to ensure that the prelink segment sizes are multiples of
+    // a page so that on non-KTRR hardware, watchtower can protect them.
+    plkInfo->plk_TEXT.plkSegInfo.vmsize = roundPageCrossSafeFixedWidth(plkInfo->plk_TEXT.plkSegInfo.vmsize);
+    plkInfo->plk_TEXT_EXEC.plkSegInfo.vmsize = roundPageCrossSafeFixedWidth(plkInfo->plk_TEXT_EXEC.plkSegInfo.vmsize);
+    plkInfo->plk_DATA_CONST.plkSegInfo.vmsize = roundPageCrossSafeFixedWidth(plkInfo->plk_DATA_CONST.plkSegInfo.vmsize);
+    plkInfo->plk_DATA.plkSegInfo.vmsize = roundPageCrossSafeFixedWidth(plkInfo->plk_DATA.plkSegInfo.vmsize);
+    plkInfo->plk_LLVM_COV.plkSegInfo.vmsize = roundPageCrossSafeFixedWidth(plkInfo->plk_LLVM_COV.plkSegInfo.vmsize);
+    plkInfo->plk_LINKEDIT.plkSegInfo.vmsize = roundPageCrossSafeFixedWidth(plkInfo->plk_LINKEDIT.plkSegInfo.vmsize);
+
+    next_vmaddr = roundPageCrossSafeFixedWidth(mySegInfo->vmaddr -
+                                               plkInfo->plk_TEXT.plkSegInfo.vmsize -
+                                               plkInfo->plk_TEXT_EXEC.plkSegInfo.vmsize -
+                                               plkInfo->plk_DATA_CONST.plkSegInfo.vmsize);
+                                               // DATA and LINKEDIT come _after_ the kernel
+
+    //
+    // grab __PRELINK_TEXT segment info.
+    //
+    seg_cmd = macho_get_segment_by_name_64(kernelHeader, kPrelinkTextSegment);
+    if (NULL == seg_cmd) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                  "%s %d - could not find %s ",
+                  __func__, __LINE__, kPrelinkTextSegment);
+        goto finish;
+    }
+
+    mySegInfo = &plkInfo->plk_TEXT.plkSegInfo;
+    mySegInfo->vmaddr = next_vmaddr;
+    plkInfo->plk_TEXT.plk_next_kext_vmaddr = mySegInfo->vmaddr;
+    mySegInfo->fileoff = next_fileoff;
+    next_fileoff += mySegInfo->vmsize;
+    // vmsize and filesize are set in __OSKextGetPLKSegSizes
+
+    next_vmaddr = mySegInfo->vmaddr + mySegInfo->vmsize;
+
+#if SPLIT_KEXTS_DEBUG
+    kcgen_verboseLog("__PRELINK_TEXT vmaddr %p to %p next vmaddr %p vmsize %llu fileoff %llu to %llu filesize %llu",
+                     (void *)mySegInfo->vmaddr,
+                     (void *) (mySegInfo->vmaddr + mySegInfo->vmsize),
+                     (void *)plkInfo->plk_TEXT.plk_next_kext_vmaddr,
+                     mySegInfo->vmsize,
+                     mySegInfo->fileoff,
+                     (mySegInfo->fileoff + mySegInfo->vmsize),
+                     mySegInfo->vmsize);
+#endif
+
+    //
+    // grab __PLK_TEXT_EXEC segment info
+    //
+    seg_cmd = macho_get_segment_by_name_64(kernelHeader, kPrelinkTextExecSegment);
+    if (NULL == seg_cmd) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                  "%s %d - could not find %s, will skip this segment... ",
+                  __func__, __LINE__, kPrelinkTextExecSegment);
+    }
+    else {
+        mySegInfo = &plkInfo->plk_TEXT_EXEC.plkSegInfo;
+        mySegInfo->vmaddr = next_vmaddr;
+        plkInfo->plk_TEXT_EXEC.plk_next_kext_vmaddr = mySegInfo->vmaddr;
+        mySegInfo->fileoff = next_fileoff;
+        next_fileoff += mySegInfo->vmsize;
+        // vmsize and filesize are set in __OSKextGetPLKSegSizes
+
+        next_vmaddr = mySegInfo->vmaddr + mySegInfo->vmsize;
+
+#if SPLIT_KEXTS_DEBUG
+        kcgen_verboseLog("__PLK_TEXT_EXEC vmaddr %p to %p next vmaddr %p vmsize %llu fileoff %llu to %llu filesize %llu",
+                         (void *)mySegInfo->vmaddr,
+                         (void *) (mySegInfo->vmaddr + mySegInfo->vmsize),
+                         (void *)plkInfo->plk_TEXT_EXEC.plk_next_kext_vmaddr,
+                         mySegInfo->vmsize,
+                         mySegInfo->fileoff,
+                         (mySegInfo->fileoff + mySegInfo->vmsize),
+                         mySegInfo->vmsize);
+#endif
+    }
+
+    //
+    // grab __PLK_DATA_CONST segment info
+    //
+    seg_cmd = macho_get_segment_by_name_64(kernelHeader, kPrelinkDataConstSegment);
+    if (NULL == seg_cmd) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                  "%s %d - could not find %s, will skip this segment... ",
+                  __func__, __LINE__, kPrelinkDataConstSegment);
+    }
+    else {
+        mySegInfo = &plkInfo->plk_DATA_CONST.plkSegInfo;
+        mySegInfo->vmaddr = next_vmaddr;
+        plkInfo->plk_DATA_CONST.plk_next_kext_vmaddr = mySegInfo->vmaddr;
+        mySegInfo->fileoff = next_fileoff;
+        next_fileoff += mySegInfo->vmsize;
+        // vmsize and filesize are set in __OSKextGetPLKSegSizes
+
+        next_vmaddr = mySegInfo->vmaddr + mySegInfo->vmsize;
+
+#if SPLIT_KEXTS_DEBUG
+        kcgen_verboseLog("__PLK_DATA_CONST vmaddr %p to %p next vmaddr %p vmsize %llu fileoff %llu to %llu filesize %llu",
+                         (void *)mySegInfo->vmaddr,
+                         (void *) (mySegInfo->vmaddr + mySegInfo->vmsize),
+                         (void *)plkInfo->plk_DATA_CONST.plk_next_kext_vmaddr,
+                         mySegInfo->vmsize,
+                         mySegInfo->fileoff,
+                         mySegInfo->fileoff + mySegInfo->vmsize,
+                         mySegInfo->vmsize);
+#endif
+    }
+ 
+    //
+    // __PRELINK_DATA, __PLK_LLVM_COV, __PLK_LINKEDIT, and __PRELINK_INFO are after the last of the kernel
+    // __DATA segments
+    //
+    result = __OSKextGetLastKernelLoadAddr(kernelImage, &next_vmaddr);
+    if (result == false) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                  "%s %d - __OSKextGetLastKernelLoadAddr failed ",
+                  __func__, __LINE__);
+        goto finish;
+    }
+    next_vmaddr = roundPageCrossSafeFixedWidth(next_vmaddr);
+
+    //
+    // grab __PRELINK_DATA segment info
+    //
+    seg_cmd = macho_get_segment_by_name_64(kernelHeader, kPrelinkDataSegment);
+    if (NULL == seg_cmd) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                  "%s %d - could not find %s ",
+                  __func__, __LINE__, kPrelinkDataSegment);
+    }
+    else {
+        mySegInfo = &plkInfo->plk_DATA.plkSegInfo;
+        mySegInfo->vmaddr = next_vmaddr;
+        plkInfo->plk_DATA.plk_next_kext_vmaddr = mySegInfo->vmaddr;
+        mySegInfo->fileoff = next_fileoff;
+        next_fileoff += mySegInfo->vmsize;
+        // vmsize and filesize are set in __OSKextGetPLKSegSizes
+
+        next_vmaddr = mySegInfo->vmaddr + mySegInfo->vmsize;
+
+#if SPLIT_KEXTS_DEBUG
+        kcgen_verboseLog("__PRELINK_DATA vmaddr %p to %p next vmaddr %p vmsize %llu fileoff %llu to %llu filesize %llu",
+                         (void *)mySegInfo->vmaddr,
+                         (void *) (mySegInfo->vmaddr + mySegInfo->vmsize),
+                         (void *)plkInfo->plk_DATA.plk_next_kext_vmaddr,
+                         mySegInfo->vmsize,
+                         mySegInfo->fileoff,
+                         mySegInfo->fileoff + mySegInfo->vmsize,
+                         mySegInfo->vmsize);
+#endif
+    }
+
+    //
+    // grab __PLK_LLVM_COV segment info
+    //
+    seg_cmd = macho_get_segment_by_name_64(kernelHeader, kPrelinkLLVMCovSegment);
+    if (NULL == seg_cmd) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                  "%s %d - could not find %s, will skip this segment... ",
+                  __func__, __LINE__, kPrelinkLLVMCovSegment);
+    }
+    else {
+        mySegInfo = &plkInfo->plk_LLVM_COV.plkSegInfo;
+        mySegInfo->vmaddr = next_vmaddr;
+        plkInfo->plk_LLVM_COV.plk_next_kext_vmaddr = mySegInfo->vmaddr;
+        mySegInfo->fileoff = next_fileoff;
+        next_fileoff += mySegInfo->vmsize;
+        // vmsize and filesize are set in __OSKextGetPLKSegSizes
+
+        next_vmaddr = mySegInfo->vmaddr + mySegInfo->vmsize;
+
+#if SPLIT_KEXTS_DEBUG
+        kcgen_verboseLog("__PLK_LLVM_COV vmaddr %p to %p next vmaddr %p vmsize %llu fileoff %llu to %llu filesize %llu",
+                         (void *)mySegInfo->vmaddr,
+                         (void *) (mySegInfo->vmaddr + mySegInfo->vmsize),
+                         (void *)plkInfo->plk_LLVM_COV.plk_next_kext_vmaddr,
+                         mySegInfo->vmsize,
+                         mySegInfo->fileoff,
+                         mySegInfo->fileoff + mySegInfo->vmsize,
+                         mySegInfo->vmsize);
+#endif
+    }
+
+    //
+    // grab __PLK_LINKEDIT segment info
+    //
+    seg_cmd = macho_get_segment_by_name_64(kernelHeader, kPrelinkLinkeditSegment);
+    if (NULL == seg_cmd) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                  "%s %d - could not find %s, will skip this segment... ",
+                  __func__, __LINE__, kPrelinkLinkeditSegment);
+    }
+    else {
+        mySegInfo = &plkInfo->plk_LINKEDIT.plkSegInfo;
+        mySegInfo->vmaddr = next_vmaddr;
+        plkInfo->plk_LINKEDIT.plk_next_kext_vmaddr = mySegInfo->vmaddr;
+        mySegInfo->fileoff = next_fileoff;
+        next_fileoff += mySegInfo->vmsize;
+        // vmsize and filesize are set in __OSKextGetPLKSegSizes
+
+        next_vmaddr = mySegInfo->vmaddr + mySegInfo->vmsize;
+
+#if SPLIT_KEXTS_DEBUG
+        kcgen_verboseLog("__PLK_LINKEDIT vmaddr %p to %p next vmaddr %p vmsize %llu fileoff %llu to %llu filesize %llu",
+                         (void *)mySegInfo->vmaddr,
+                         (void *) (mySegInfo->vmaddr + mySegInfo->vmsize),
+                         (void *)plkInfo->plk_LINKEDIT.plk_next_kext_vmaddr,
+                         mySegInfo->vmsize,
+                         mySegInfo->fileoff,
+                         mySegInfo->fileoff + mySegInfo->vmsize,
+                         mySegInfo->vmsize);
+#endif
+    }
+
+    //
+    // grab __PRELINK_INFO segment info
+    //
+
+    seg_cmd = macho_get_segment_by_name_64(kernelHeader, kPrelinkInfoSegment);
+    if (NULL == seg_cmd) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                  "%s %d - could not find %s ",
+                  __func__, __LINE__, kPrelinkInfoSegment);
+        goto finish;
+    }
+
+    mySegInfo = &plkInfo->plk_INFO;
+    mySegInfo->vmaddr = next_vmaddr;
+    mySegInfo->fileoff = next_fileoff;
+    // real sizes calculated later
+    mySegInfo->vmsize = seg_cmd->vmsize;
+    
+#if SPLIT_KEXTS_DEBUG
+    kcgen_verboseLog("__PRELINK_INFO vmaddr %p vmsize %llu fileoff %llu filesize %llu",
+                     (void *)mySegInfo->vmaddr,
+                     mySegInfo->vmsize,
+                     mySegInfo->fileoff,
+                     mySegInfo->vmsize);
+#endif
+
+    // next_fileoff is the total length of the known parts of the kernelcache
+    // file.  We will grow kernelCacheImage with CFDataIncreaseLength once we
+    // know how big the __PRELINK_INFO data is.
+    plkInfo->kernelCacheImage = CFDataCreateMutable(kCFAllocatorDefault, next_fileoff);
+    if (plkInfo->kernelCacheImage == NULL) {
+        OSKextLogMemError();
+        goto finish;
+    }
+    CFDataSetLength(plkInfo->kernelCacheImage, next_fileoff);
+#if SPLIT_KEXTS_DEBUG
+    {
+        u_char *prelinkData = CFDataGetMutableBytePtr(plkInfo->kernelCacheImage);
+        kcgen_verboseLog("plkInfo->kernelCacheImage @%p - %p (%d bytes)",
+                         prelinkData, prelinkData + (unsigned int)next_fileoff, (unsigned int)next_fileoff);
+    }
+#endif
+
+    result = true;
+
+finish:
+    return result;
+}
+
+static macho_seek_result
+_macho_section_size_accumulator(struct load_command *lc, const void * file_end __unused, uint8_t swap __unused, void *user_data) {
+    struct segment_command_64 *seg;
+    struct section_64 *sec;
+    uint64_t start_off, end_off;
+    uint64_t max_off = 0;
+    struct max_data *md;
+    enum enumSegIdx segIndex;
+
+    md = (struct max_data *)user_data;
+
+    //kcgen_verboseLog("md %p lc->cmd %x cmdSize %x", md, lc->cmd, lc->cmdsize);
+
+    switch(lc->cmd) {
+    case LC_SEGMENT_64:
+        seg = (struct segment_command_64 *)lc;
+        //kcgen_verboseLog("seg->cmd %x cmdSize %x segname %s vmaddr %llx vmsize %llx nsect %d", seg->cmd, seg->cmdsize, seg->segname, seg->vmaddr, seg->vmsize, seg->nsects);
+        sec = (struct section_64 *)((char *)seg + sizeof(struct segment_command_64));
+        for(unsigned int i=0; i < seg->nsects; ++i) {
+            start_off = sec->addr - seg->vmaddr;
+            end_off = start_off + sec->size;
+            max_off = (end_off > max_off) ? end_off : max_off;
+            //kcgen_verboseLog("sec %d (%s %s) addr %llx size %llx start_off %llx end_off %llx max_off %llx", i, sec->segname, sec->sectname, sec->addr, sec->size, start_off, end_off, max_off);
+            sec = (struct section_64 *)((char *)sec + sizeof(struct section_64));
+        }
+        assert(getSegIndex(seg->segname, &segIndex));
+        assert(segIndex < SEG_IDX_COUNT);
+
+        md->seg_data[segIndex].vmaddr  = seg->vmaddr;
+        md->seg_data[segIndex].vmsz    = seg->vmsize;
+        md->seg_data[segIndex].max_off = max_off ? max_off : seg->vmsize;
+        break;
+    default:
+        return macho_seek_result_not_found;
+    }
+
+    return macho_seek_result_not_found;
+}
+
+static void __OSKextGetEffectiveSegmentSizes(OSKextRef kext, struct max_data *md) {
+    CFDataRef kextExecutable = NULL;
+    struct mach_header *hdr;
+    void *file_end;
+
+    kextExecutable = OSKextCopyExecutableForArchitecture(kext,
+                        OSKextGetArchitecture());
+
+    assert(kextExecutable);
+    
+    hdr = (struct mach_header *)CFDataGetBytePtr(kextExecutable);
+    file_end = (char *)hdr + CFDataGetLength(kextExecutable);
+    
+    macho_scan_load_commands(hdr, file_end, _macho_section_size_accumulator, md);
+
+    CFRelease(kextExecutable);
+}
+
+    
+/*********************************************************************
+ * Use this routine to calculate the sizes of all the Prelinked Kernel
+ * (plk) segments.  Until we can rebase and split the kernel binary
+
+ * we need to know how big each of these segments will be so we know
+ * the vmaddrs and fileoffsets (within kernelcache file).
+ * NOTE - currently knows about:
+ * __PRELINK_TEXT
+ * __PLK_TEXT_EXEC
+ * __PRELINK_DATA
+ * __PLK_DATA_CONST
+ * __PLK_LLVM_COV
+ * __PLK_LINKEDIT
+ * __PRELINK_INFO is calculated later.
+ *********************************************************************/
+static boolean_t __OSKextGetPLKSegSizes(
+                                        CFArrayRef       kextArray,
+                                        plkInfo *        segInfo )
+{
+    boolean_t                   result = false;
+    CFIndex                     count, i;
+    CFDataRef                   kextExecutable = NULL;  // must release
+    struct mach_header_64 *     kextHeader;
+    CFMutableArrayRef           loadList = NULL; // must release
+    OSKextRef                   thisKext = NULL;
+    uint64_t segWaste_TEXT, segWaste_TEXT_EXEC, segWaste_DATA, segWaste_DATA_CONST;
+    uint64_t segWasteTotal;
+    uint64_t plkseg_vmsize;
+    char kextPath[PATH_MAX];
+    uint64_t prevSegEndAddr[SEG_IDX_COUNT] = {0};
+
+    loadList = OSKextCopyLoadListForKexts(kextArray, false);
+    if (loadList == NULL) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                  "%s %d - OSKextCopyLoadListForKexts failed ",
+                  __func__, __LINE__);
+        goto finish;
+    }
+
+    segInfo->plk_TEXT.plk_seg_name = kPrelinkTextSegment;
+    segInfo->plk_TEXT_EXEC.plk_seg_name = kPrelinkTextExecSegment;
+    segInfo->plk_DATA.plk_seg_name = kPrelinkDataSegment;
+    segInfo->plk_DATA_CONST.plk_seg_name = kPrelinkDataConstSegment;
+    segInfo->plk_LLVM_COV.plk_seg_name = kPrelinkLLVMCovSegment;
+    segInfo->plk_LINKEDIT.plk_seg_name = kPrelinkLinkeditSegment;
+
+    count = CFArrayGetCount(loadList);
+    nNonSplitKexts = 0;
+    nSplitKexts = 0;
+
+    /* count split and non split kexts */
+    for(i = 0; i < count; i++) {
+        SAFE_RELEASE_NULL(kextExecutable);
+        thisKext = (OSKextRef)CFArrayGetValueAtIndex(loadList, i);
+        
+        /* don't count non executable and interface kexts */
+        if (OSKextDeclaresExecutable(thisKext) == false || OSKextIsInterface(thisKext)) {
+            continue;
+        }
+
+        kextExecutable = OSKextCopyExecutableForArchitecture(thisKext,
+                                                             OSKextGetArchitecture());
+
+        if (kextExecutable == NULL) {
+            continue;
+        }
+
+        /* check for split kexts */
+        kextHeader = (struct mach_header_64 *)CFDataGetBytePtr(kextExecutable);
+        if (__OSKextIsSplitKextMacho64(kextHeader)) {
+            nSplitKexts++;
+            if (nNonSplitKexts > 0) {
+                __OSKextGetFileSystemPath(thisKext, NULL, true, kextPath);
+                OSKextLog(thisKext,
+                          kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                          "non-split KC: kext '%s' was compiled as a 'split' kext: aborting! <%s %d>",
+                          kextPath, __func__, __LINE__);
+                abort();
+            }
+        } else {
+            nNonSplitKexts++;
+            if (nSplitKexts > 0) {
+                __OSKextGetFileSystemPath(thisKext, NULL, true, kextPath);
+                OSKextLog(thisKext,
+                          kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                          "split KC: kext '%s' was not compiled as a 'split' kext: aborting! <%s %d>",
+                          kextPath, __func__, __LINE__);
+                abort();
+            }
+        }
+    }
+
+    /* all or nothing */
+    if (nSplitKexts) {
+        assert(nNonSplitKexts == 0);
+    }
+ 
+    segWaste_TEXT = segWaste_TEXT_EXEC = segWaste_DATA = segWaste_DATA_CONST = 0;
+
+    for (i = 0; i < count; i++) {
+        SAFE_RELEASE_NULL(kextExecutable);
+        thisKext = (OSKextRef)CFArrayGetValueAtIndex(loadList, i);
+
+        kextExecutable = OSKextCopyExecutableForArchitecture(thisKext,
+                                                             OSKextGetArchitecture());
+        if (kextExecutable == NULL) {
+            continue;
+        }
+
+        __OSKextGetFileSystemPath(thisKext, NULL, true, kextPath);
+        kcgen_verboseLog("Processing kext: %s (sz:%ld)",
+                         kextPath, CFDataGetLength(kextExecutable));
+
+        /* special case for processing old style kexts.
+         * we take them into the kernel cache PRELINK_TEXT segment whole. 
+         * we don't support a mixture of split and non split kexts 
+         */ 
+        if (!nSplitKexts) {
+            uint64_t vmsize;
+            assert(nNonSplitKexts);
+
+            vmsize = getKCPlkSegVMSize(segInfo, SEG_IDX_TEXT);
+            vmsize += roundPageCrossSafe(CFDataGetLength(kextExecutable));
+            setKCPlkSegVMSize(segInfo, SEG_IDX_TEXT, vmsize);
+            continue;
+        }
+
+        /* debug printing / accounting */
+        {
+            struct max_data md;
+            bzero(&md, sizeof md);
+            __OSKextGetEffectiveSegmentSizes(thisKext, &md);
+
+            segWaste_TEXT       += md.seg_data[SEG_IDX_TEXT].vmsz - md.seg_data[SEG_IDX_TEXT].max_off;
+            segWaste_TEXT_EXEC  += md.seg_data[SEG_IDX_TEXT_EXEC].vmsz - md.seg_data[SEG_IDX_TEXT_EXEC].max_off;
+            segWaste_DATA       += md.seg_data[SEG_IDX_DATA].vmsz - md.seg_data[SEG_IDX_DATA].max_off;
+            segWaste_DATA_CONST += md.seg_data[SEG_IDX_DATA_CONST].vmsz - md.seg_data[SEG_IDX_DATA_CONST].max_off;
+        }
+
+        kextHeader = (struct mach_header_64 *)CFDataGetBytePtr(kextExecutable);
+        macho_swap((u_char *) kextHeader);
+
+        /* all kexts other than interface kexts expected to have TEXT_EXEC segment */
+        if (!OSKextIsInterface(thisKext)) {
+            assert(macho_get_segment_by_name_64((struct mach_header_64 *)CFDataGetBytePtr(kextExecutable), SEG_TEXT_EXEC) != NULL);
+        }
+
+
+        for (enum enumSegIdx segIndex = SEG_IDX_TEXT; segIndex < SEG_IDX_COUNT; segIndex++) {
+            uint64_t __unused my_vmaddr, __unused my_fileoff, __unused my_filesize, __unused next_vmaddr;
+            uint64_t my_vmsize, my_maxalign, prevAlignWaste;
+            char *segName = segIdxToName(segIndex);
+            boolean_t result;
+            uint64_t sz;
+
+            result = __OSKextGetSegmentInfo((const UInt8 *)kextHeader, segName, &my_vmaddr, &my_vmsize, &my_fileoff, &my_filesize, &my_maxalign, true);
+            sz = my_vmsize;
+            if (!result && segIndex == SEG_IDX_TEXT) {
+                sz = sizeof(*kextHeader) + kextHeader->sizeofcmds;
+            } else if (!result) {
+                continue;
+            }
+
+            /* increment target segment size in kernel cache */
+            prevAlignWaste = __OSKextAlignAddress(prevSegEndAddr[segIndex], my_maxalign) - prevSegEndAddr[segIndex];
+            sz += prevAlignWaste;
+            prevSegEndAddr[segIndex] += sz;
+            plkseg_vmsize = getKCPlkSegVMSize(segInfo, segIndex);
+            kcgen_verboseLog("segIndex %d segName %s kcSegVMSize %llx sz %llx", segIndex, segName, plkseg_vmsize, sz);
+            setKCPlkSegVMSize(segInfo, segIndex, plkseg_vmsize + sz);
+        } // for each segment
+    } // for each kext
+
+    segWasteTotal = segWaste_TEXT + segWaste_TEXT_EXEC + segWaste_DATA + segWaste_DATA_CONST;
+    kcgen_verboseLog("nkexts %ld segment waste TEXT %llu TEXT_EXEC %llu DATA %llu DATA_CONST %llu totals %llu", 
+                      count, segWaste_TEXT, segWaste_TEXT_EXEC, segWaste_DATA, segWaste_DATA_CONST, segWasteTotal);
+ 
+    for (enum enumSegIdx i = SEG_IDX_TEXT; i < SEG_IDX_COUNT; ++i) {
+        plkseg_vmsize = getKCPlkSegVMSize(segInfo, i);
+        setKCPlkSegVMSize(segInfo, i, roundPageCrossSafe(plkseg_vmsize));
+    }
+
+    for(enum enumSegIdx i = SEG_IDX_TEXT; i < SEG_IDX_COUNT; ++i) {
+        kcgen_verboseLog("PLK_%s vmsize:%llu", segIdxToName(i), getKCPlkSegVMSize(segInfo, i));
+    }
+
+    result = true;
+
+finish:
+    SAFE_RELEASE(loadList);
+    SAFE_RELEASE(kextExecutable);
+    return result;
+}
+
+static boolean_t __OSKextSetPLKSegInfo(plkInfo *plkInfo)
+{
+    struct _seginfo {
+        const char *seg_name;
+        uint64_t    seg_vmsize;
+        uint64_t    seg_vmaddr;
+        SegInfo    *seg_info;
+        vm_prot_t   seg_maxprot;
+        vm_prot_t   seg_initprot;
+        const char *sect_name;
+        SegInfo    *sect_info;
+    };
+
+    boolean_t ret = false;
+
+    struct _seginfo plkseg[SEG_IDX_COUNT] = {
+        { .seg_name = plkInfo->plk_TEXT.plk_seg_name,
+          .seg_vmsize = getKCPlkSegVMSize(plkInfo, SEG_IDX_TEXT),
+          .seg_vmaddr = getKCPlkSegVMAddr(plkInfo, SEG_IDX_TEXT),
+          .seg_info = &plkInfo->plk_TEXT.plkSegInfo,
+          .seg_maxprot  = PROT_READ,
+          .seg_initprot = PROT_READ,
+          .sect_name = kPrelinkTextSection,
+          .sect_info = &plkInfo->plk_TEXT.plkSegInfo
+        },
+        { .seg_name = plkInfo->plk_TEXT_EXEC.plk_seg_name,
+          .seg_vmsize = getKCPlkSegVMSize(plkInfo, SEG_IDX_TEXT_EXEC),
+          .seg_vmaddr = getKCPlkSegVMAddr(plkInfo, SEG_IDX_TEXT_EXEC),
+          .seg_info = &plkInfo->plk_TEXT_EXEC.plkSegInfo,
+          .seg_maxprot  = PROT_READ | PROT_EXEC,
+          .seg_initprot = PROT_READ | PROT_EXEC,
+          .sect_name = kPrelinkTextSection,
+          .sect_info = &plkInfo->plk_TEXT_EXEC.plkSegInfo
+        },
+        { .seg_name = plkInfo->plk_DATA.plk_seg_name,
+          .seg_vmsize = getKCPlkSegVMSize(plkInfo, SEG_IDX_DATA),
+          .seg_vmaddr = getKCPlkSegVMAddr(plkInfo, SEG_IDX_DATA),
+          .seg_info = &plkInfo->plk_DATA.plkSegInfo,
+          .seg_maxprot  = PROT_READ | PROT_WRITE,
+          .seg_initprot = PROT_READ | PROT_WRITE,
+          .sect_name = kPrelinkDataSection,
+          .sect_info = &plkInfo->plk_DATA.plkSegInfo
+        },
+        { .seg_name = plkInfo->plk_DATA_CONST.plk_seg_name,
+          .seg_vmsize = getKCPlkSegVMSize(plkInfo, SEG_IDX_DATA_CONST),
+          .seg_vmaddr = getKCPlkSegVMAddr(plkInfo, SEG_IDX_DATA_CONST),
+          .seg_info = &plkInfo->plk_DATA_CONST.plkSegInfo,
+          .seg_maxprot  = PROT_READ,
+          .seg_initprot = PROT_READ,
+          .sect_name = kPrelinkDataSection,
+          .sect_info = &plkInfo->plk_DATA_CONST.plkSegInfo
+        },
+        { .seg_name = plkInfo->plk_LLVM_COV.plk_seg_name,
+          .seg_vmsize = getKCPlkSegVMSize(plkInfo, SEG_IDX_LLVM_COV),
+          .seg_vmaddr = getKCPlkSegVMAddr(plkInfo, SEG_IDX_LLVM_COV),
+          .seg_info = &plkInfo->plk_LLVM_COV.plkSegInfo,
+          .seg_maxprot  = PROT_READ | PROT_WRITE,
+          .seg_initprot = PROT_READ | PROT_WRITE,
+          .sect_name = kPrelinkLLVMCovSection,
+          .sect_info = &plkInfo->plk_LLVM_COV.plkSegInfo
+        },
+        { .seg_name = plkInfo->plk_LINKEDIT.plk_seg_name,
+          .seg_vmsize = getKCPlkSegVMSize(plkInfo, SEG_IDX_LINKEDIT),
+          .seg_vmaddr = getKCPlkSegVMAddr(plkInfo, SEG_IDX_LINKEDIT),
+          .seg_info = &plkInfo->plk_LINKEDIT.plkSegInfo,
+          .seg_maxprot  = PROT_READ,
+          .seg_initprot = PROT_READ,
+          .sect_name = kPrelinkLinkeditSection,
+          .sect_info = &plkInfo->plk_LINKEDIT.plkSegInfo
+        }
+    };
+    
+    for (size_t i = 0; i < sizeof(plkseg)/sizeof(plkseg[0]); i++) {
+        uint64_t seg_vmbase = plkseg[i].seg_vmaddr;
+        uint64_t seg_vmsize = plkseg[i].seg_vmsize;
+        
+        kcgen_verboseLog("SetSegInfo[%s] = {0x%llX + %lld (ofst:%lld, sz:%lld)}",
+                         plkseg[i].seg_name,
+                         plkseg[i].seg_info->vmaddr,
+                         seg_vmsize, 
+                         plkseg[i].seg_info->fileoff,
+                         seg_vmsize);
+        /* set segment info */
+        if (__OSKextSetSegmentAddress(plkInfo->kernelCacheImage,
+                                      plkseg[i].seg_name,
+                                      seg_vmbase) == false) {
+            kcgen_warning("__OSKextSetSegmentAddress FAILED for %s", plkseg[i].seg_name);
+            goto finish;
+        }
+        if (__OSKextSetSegmentVMSize(plkInfo->kernelCacheImage,
+                                     plkseg[i].seg_name,
+                                     seg_vmsize) == false) {
+            kcgen_warning("__OSKextSetSegmentVMSize FAILED for %s", plkseg[i].seg_name);
+            goto finish;
+        }
+        if (__OSKextSetSegmentOffset(plkInfo->kernelCacheImage,
+                                     plkseg[i].seg_name,
+                                     plkseg[i].seg_info->fileoff) == false) {
+            kcgen_warning("__OSKextSetSegmentOffset FAILED for %s", plkseg[i].seg_name);
+            goto finish;
+        }
+
+        /* prelink segment vmsize == filesize */
+        if (__OSKextSetSegmentFilesize(plkInfo->kernelCacheImage,
+                                       plkseg[i].seg_name,
+                                       seg_vmsize) == false) {
+            kcgen_warning("__OSKextSetSegmentFilesize FAILED for %s", plkseg[i].seg_name);
+            goto finish;
+        }
+        if (__OSKextSetSegmentProtection(plkInfo->kernelCacheImage,
+                                         plkseg[i].seg_name,
+                                         plkseg[i].seg_initprot,
+                                         plkseg[i].seg_maxprot) == false) {
+            kcgen_warning("__OSKextSetSegmentProtection FAILED for %s", plkseg[i].seg_name);
+            goto finish;
+        }
+        /* set single-section in the segment */
+        if (__OSKextSetSectionAddress(plkInfo->kernelCacheImage,
+                                      plkseg[i].seg_name, plkseg[i].sect_name,
+                                      seg_vmbase) == false) {
+            kcgen_warning("__OSKextSetSectionAddress FAILED for %s,%s",
+                          plkseg[i].seg_name, plkseg[i].sect_name);
+            goto finish;
+        }
+        if (__OSKextSetSectionOffset(plkInfo->kernelCacheImage,
+                                     plkseg[i].seg_name, plkseg[i].sect_name,
+                                     plkseg[i].sect_info->fileoff) == false) {
+            kcgen_warning("__OSKextSetSectionOffset FAILED for %s,%s",
+                          plkseg[i].seg_name, plkseg[i].sect_name);
+            goto finish;
+        }
+        if (__OSKextSetSectionSize(plkInfo->kernelCacheImage,
+                                   plkseg[i].seg_name, plkseg[i].sect_name,
+                                   seg_vmsize) == false) {
+            kcgen_warning("__OSKextSetSectionSize FAILED for %s,%s",
+                          plkseg[i].seg_name, plkseg[i].sect_name);
+            goto finish;
+        }
+    }
+
+    ret = true;
+
+finish:
+    return ret;
+}
+
+/*********************************************************************
+ *********************************************************************/
+
+static uint32_t __OSKextGetSegMaxAlignment(
+                                        struct segment_command_64 * seg_cmd)
+{
+    struct section_64 * sect = NULL;
+    uint32_t            i = 0;
+    uint32_t            result = KEXT_MIN_ALIGN;
+
+    if (seg_cmd->cmd != LC_SEGMENT_64)
+        goto finish;
+
+    sect = (struct section_64 *)(&seg_cmd[1]);
+    for (i = 0; i < seg_cmd->nsects; ++i, ++sect) {
+        if (sect->align > result) {
+            result = sect->align;
+        }
+    }
+
+    if (!strncmp(seg_cmd->segname, SEG_TEXT_EXEC, sizeof(seg_cmd->segname))) {
+        result = 12;
+    }
+
+    if (g_max_align_to_4k && result < 12)
+        result = 12;
+
+finish:
+    return result;
+}
+
+/*********************************************************************
+ *********************************************************************/
+
+static uint64_t __OSKextAlignAddress(uint64_t address, uint32_t align)
+{
+    uint64_t alignment = (1 << align);
+    uint64_t low_bits = 0;
+    
+    if (align == 0) return address;
+    
+    low_bits = (address) & (alignment - 1);
+    if (low_bits) {
+        address += (alignment - low_bits);
+    }
+    
+    return address;
+}
+
+/*********************************************************************
+ *********************************************************************/
+static boolean_t __OSKextGetSegmentAddressAndOffsetDataRef(
+    CFDataRef       imageRef,
+    const char *    segname,
+    uint32_t *      fileOffsetOut,
+    uint64_t *      loadAddrOut)
+{
+    boolean_t       result;
+    const UInt8 *   imagePtr = CFDataGetBytePtr(imageRef);
+    
+    result = __OSKextGetSegmentAddressAndOffset(imagePtr, segname, fileOffsetOut, loadAddrOut);
+    
+    return result;
+}
+
+/*********************************************************************
 *********************************************************************/
 static boolean_t __OSKextGetSegmentAddressAndOffset(
-    CFDataRef kernelImage, const char *segname, 
-    uint32_t *fileOffsetOut, uint64_t *loadAddrOut)
+    const UInt8 *   imagePtr,
+    const char *    segname,
+    uint32_t *      fileOffsetOut,
+    uint64_t *      loadAddrOut)
 {
     boolean_t result = false;
     uint32_t fileOffset = 0;
     uint64_t loadAddr = 0;
     
     if (!__OSKextIsArchitectureLP64()) {
-        struct mach_header *mach_header = (struct mach_header *) CFDataGetBytePtr(kernelImage);
+        struct mach_header *mach_header = (struct mach_header *) imagePtr;
         struct segment_command *seg = macho_get_segment_by_name(mach_header, segname);
         if (!seg) {
             goto finish;
@@ -14355,7 +17359,7 @@ static boolean_t __OSKextGetSegmentAddressAndOffset(
         fileOffset = seg->fileoff;
         loadAddr = seg->vmaddr;
     } else {
-        struct mach_header_64 *mach_header = (struct mach_header_64 *) CFDataGetBytePtr(kernelImage);
+        struct mach_header_64 *mach_header = (struct mach_header_64 *) imagePtr;
         struct segment_command_64 *seg = macho_get_segment_by_name_64(mach_header, segname);
         if (!seg) {
             goto finish;
@@ -14373,18 +17377,241 @@ finish:
     return result;
 }
 
+
 /*********************************************************************
-*********************************************************************/
+ *********************************************************************/
+//static boolean_t __OSKextGetSegmentInfoDataRef(
+//    CFDataRef       imageRef,
+//    const char *    segname,
+//    uint64_t *      vmaddrOut,
+//    uint64_t *      vmsizeOut,
+//    uint64_t *      fileoffOut,
+//    uint64_t *      filesizeOut)
+//{
+//    boolean_t       result;
+//    const UInt8 *   imagePtr = CFDataGetBytePtr(imageRef);
+//    
+//    result = __OSKextGetSegmentInfo(imagePtr, segname, vmaddrOut, vmsizeOut, fileoffOut, filesizeOut);
+//    
+//    return result;
+//}
+
+/*********************************************************************
+ *********************************************************************/
+static boolean_t __OSKextGetSegmentInfo(
+    const UInt8 *   imagePtr,
+    const char *    segname,
+    uint64_t *      vmaddrOut,
+    uint64_t *      vmsizeOut,
+    uint64_t *      fileoffOut,
+    uint64_t *      filesizeOut,
+    uint64_t *      maxAlignOut,
+    boolean_t       truncateSegs)
+{
+    boolean_t result = false;
+    uint64_t max_off = 0;
+
+    /* do the normal thing for LINKEDIT/LLVM_COV regardless of truncateSegs flag */
+    if (truncateSegs && (!strcmp(segname, SEG_LINKEDIT) || !strcmp(segname, SEG_LLVM_COV)))
+        truncateSegs = false;
+
+    if (__OSKextIsArchitectureLP64()) {
+        struct mach_header_64 *mach_header = (struct mach_header_64 *) imagePtr;
+        struct segment_command_64 *seg = macho_get_segment_by_name_64(mach_header, segname);
+        if (!seg) {
+            goto finish;
+        }
+
+        if (maxAlignOut) *maxAlignOut = __OSKextGetSegMaxAlignment(seg);
+
+        /* special case for __TEXT segment. max_off is at least size of mach header + load commands */
+        if (truncateSegs && !strcmp(segname, "__TEXT")) {
+            max_off = sizeof(*mach_header) + mach_header->sizeofcmds;
+        }
+
+        if (vmaddrOut) *vmaddrOut = seg->vmaddr;
+        if (vmsizeOut) {
+            if (truncateSegs) {
+                /* walk the sections for this segment, compute vmsize based on highest used offset
+                 * instead of trusting what the segment header says.
+                 */
+                struct section_64 *sect = (struct section_64 *) &seg[1];
+                uint64_t off, end_off;
+
+                for (unsigned int i = 0; i < seg->nsects; ++i, ++sect) {
+                    off = sect->addr - seg->vmaddr;
+                    end_off = off + sect->size;
+                    max_off = (end_off > max_off) ? end_off : max_off;
+#if 0
+                    kcgen_verboseLog("sect %d %s %s seg_vmaddr %llx seg_vmsize %llx sect_off %llx sect_end_off %llx max_off %llx",
+                                     i, sect->segname, sect->sectname, seg->vmaddr, seg->vmsize, off, end_off, max_off);
+#endif
+                }
+
+                *vmsizeOut = max_off;
+            } else {
+                *vmsizeOut = seg->vmsize;
+            }
+        }
+
+        if (fileoffOut) *fileoffOut = seg->fileoff;
+        if (filesizeOut) {
+            if (truncateSegs) {
+                /* previous truncateSegs code has to have run */
+                assert(vmsizeOut);
+                *filesizeOut = max_off;
+            } else {
+                *filesizeOut = seg->filesize;
+            }
+        }
+    } else {
+        struct mach_header *mach_header = (struct mach_header *) imagePtr;
+        struct segment_command *seg = macho_get_segment_by_name(mach_header, segname);
+        if (!seg) {
+            goto finish;
+        }
+
+        /* special case for __TEXT segment. max_off is at least size of mach header + load commands */
+        if (truncateSegs && !strcmp(segname, "__TEXT")) {
+            max_off = sizeof(*mach_header) + mach_header->sizeofcmds;
+        }
+
+        if (vmaddrOut) *vmaddrOut = seg->vmaddr;
+        if (vmsizeOut) {
+            if (truncateSegs) {
+                /* walk the sections for this segment, compute vmsize based on highest used offset
+                 * instead of trusting what the segment header says.
+                 */
+                struct section *sect = (struct section *) &seg[1];
+                uint32_t off, end_off, max_off = 0;
+
+                for(unsigned int i = 0; i < seg->nsects; ++i, ++sect) {
+                    off = sect->addr - seg->vmaddr;
+                    end_off = off + sect->size;
+                    max_off = (end_off > max_off) ? end_off : max_off;
+                    kcgen_verboseLog("sect %d %s %s seg_vmaddr %x seg_vmsize %x sect_off %x sect_end_off %x max_off %x",
+                                     i, sect->segname, sect->sectname, seg->vmaddr, seg->vmsize, off, end_off, max_off);
+                }
+
+                *vmsizeOut = max_off;
+            } else {
+                *vmsizeOut = seg->vmsize;
+            }
+            *vmsizeOut = seg->vmsize;
+        }
+        if (fileoffOut) *fileoffOut = seg->fileoff;
+        if (filesizeOut) *filesizeOut = seg->filesize;
+    }
+
+    result = true;
+
+finish:
+    return result;
+}
+
+/*********************************************************************
+ * 'imageOffset' is an offset into the kext as layed out in
+ *               memory, i.e., it's a VA offset.
+ * 'segnameOut' will be the segment in which 'imageOffset' was found
+ * 'segOffsetOut' will be the relative VA offset of 'imageOffset'
+ *                from the start of the segment in which it was found.
+ *********************************************************************/
+static boolean_t __OSKextGetSegmentInfoForOffset(
+                                                 const UInt8 *  imagePtr,
+                                                 uint64_t       imageOffset,
+                                                 char           segnameOut[MAX_SEGNAME_LEN],
+                                                 uint64_t *     segOffsetOut,
+                                                 uint64_t *     vmaddrOut,
+                                                 uint64_t *     vmsizeOut,
+                                                 uint64_t *     fileoffOut,
+                                                 uint64_t *     filesizeOut)
+{
+    assert(segnameOut);
+    assert(vmaddrOut);
+    assert(vmsizeOut);
+    assert(fileoffOut);
+    assert(filesizeOut);
+
+    /* ordered by most likely relocation target */
+    static const char  *SegsToLookup[] = {SEG_DATA_CONST, SEG_DATA, SEG_TEXT_EXEC, SEG_LLVM_COV, SEG_LINKEDIT};
+    static const size_t nSegsToLookup = sizeof(SegsToLookup) / sizeof(char *);
+
+    /*
+     * Offsets are relative to the first VM address in the kext. There could be zerofill sections in the kext that throw
+     * off the use of file offset calculation. We need to grab the first vm address in the kext to calculate the vm
+     * address corresponding to the offset, and then locate the resulting address in a segment.
+     */
+    uint64_t text_vmaddr = 0, text_vmsize = 0, text_fileoff = 0, text_filesize = 0;
+    if (!__OSKextGetSegmentInfo(imagePtr,
+                                SEG_TEXT,
+                                &text_vmaddr,
+                                &text_vmsize,
+                                &text_fileoff,
+                                &text_filesize, NULL, false)) {
+        return false;
+    }
+
+    uint64_t imageVMAddr = text_vmaddr + imageOffset;
+
+    if (imageVMAddr < text_vmaddr + text_vmsize) {
+        strncpy(segnameOut, SEG_TEXT, MAX_SEGNAME_LEN);
+        *vmaddrOut = text_vmaddr;
+        *vmsizeOut = text_vmsize;
+        *fileoffOut = text_fileoff;
+        *filesizeOut = text_filesize;
+        *segOffsetOut = imageVMAddr - text_vmaddr;
+        return true;
+    }
+
+    for (size_t i = 0; i < nSegsToLookup; i++) {
+        if (__OSKextGetSegmentInfo(imagePtr,
+                                   SegsToLookup[i],
+                                   vmaddrOut,
+                                   vmsizeOut,
+                                   fileoffOut,
+                                   filesizeOut, NULL, false)) {
+            if (imageVMAddr >= *vmaddrOut &&
+                imageVMAddr < (*vmaddrOut + *vmsizeOut)) {
+                strncpy(segnameOut, SegsToLookup[i], MAX_SEGNAME_LEN);
+                *segOffsetOut = imageVMAddr - *vmaddrOut;
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+/*********************************************************************
+ *********************************************************************/
+static boolean_t __OSKextGetSegmentFileAndVMSizeDataRef(
+    CFDataRef       imageRef,
+    const char *    segname,
+    uint64_t *      fileSizeOut,
+    uint64_t *      VMSizeOut)
+{
+    boolean_t       result;
+    const UInt8 *   imagePtr = CFDataGetBytePtr(imageRef);
+    
+    result = __OSKextGetSegmentFileAndVMSize(imagePtr, segname, fileSizeOut, VMSizeOut);
+
+    return result;
+}
+
+/*********************************************************************
+ *********************************************************************/
 static boolean_t __OSKextGetSegmentFileAndVMSize(
-    CFDataRef kernelImage, const char *segname, 
-    uint64_t *fileSizeOut, uint64_t *VMSizeOut)
+    const UInt8 *   imagePtr,
+    const char *    segname,
+    uint64_t *      fileSizeOut,
+    uint64_t *      VMSizeOut)
 {
     boolean_t result = false;
     uint64_t filesize = 0;
     uint64_t vmsize = 0;
     
     if (!__OSKextIsArchitectureLP64()) {
-        struct mach_header *mach_header = (struct mach_header *) CFDataGetBytePtr(kernelImage);
+        struct mach_header *mach_header = (struct mach_header *) imagePtr;
         struct segment_command *seg = macho_get_segment_by_name(mach_header, segname);
         if (!seg) {
             goto finish;
@@ -14393,7 +17620,7 @@ static boolean_t __OSKextGetSegmentFileAndVMSize(
         filesize = seg->filesize;
         vmsize = seg->vmsize;
     } else {
-        struct mach_header_64 *mach_header = (struct mach_header_64 *) CFDataGetBytePtr(kernelImage);
+        struct mach_header_64 *mach_header = (struct mach_header_64 *) imagePtr;
         struct segment_command_64 *seg = macho_get_segment_by_name_64(mach_header, segname);
         if (!seg) {
             goto finish;
@@ -14402,11 +17629,11 @@ static boolean_t __OSKextGetSegmentFileAndVMSize(
         filesize = seg->filesize;
         vmsize = seg->vmsize;
     }
-
+    
     if (fileSizeOut) *fileSizeOut = filesize;
     if (VMSizeOut) *VMSizeOut = vmsize;
     result = true;
-
+    
 finish:
     return result;
 }
@@ -14537,6 +17764,74 @@ finish:
 
 /*********************************************************************
 *********************************************************************/
+static boolean_t __OSKextSetSegmentProtection(
+    CFDataRef kernelImage, const char *segname, vm_prot_t initprot, vm_prot_t maxprot)
+{
+    boolean_t result = false;
+
+    if (!__OSKextIsArchitectureLP64()) {
+        struct mach_header *mach_header = (struct mach_header *) CFDataGetBytePtr(kernelImage);
+        struct segment_command *seg = macho_get_segment_by_name(mach_header, segname);
+        if (!seg) {
+            goto finish;
+        }
+
+        seg->initprot = initprot;
+        seg->maxprot = maxprot;
+    } else {
+        struct mach_header_64 *mach_header = (struct mach_header_64 *) CFDataGetBytePtr(kernelImage);
+        struct segment_command_64 *seg = macho_get_segment_by_name_64(mach_header, segname);
+        if (!seg) {
+            goto finish;
+        }
+
+        seg->initprot = initprot;
+        seg->maxprot = maxprot;
+    }
+
+    kcgen_verboseLog(" --> SET %s to initprot:0x%X, maxprot:0x%X", segname, initprot, maxprot);
+    result = true;
+
+finish:
+    return result;
+}
+
+/*********************************************************************
+*********************************************************************/
+static boolean_t __OSKextMachOSetSegmentProtection(
+    void *header, const char *segname, vm_prot_t initprot, vm_prot_t maxprot)
+{
+    boolean_t result = false;
+
+    if (!__OSKextIsArchitectureLP64()) {
+        struct mach_header *mach_header = (struct mach_header *)header;
+        struct segment_command *seg = macho_get_segment_by_name(mach_header, segname);
+        if (!seg) {
+            goto finish;
+        }
+
+        seg->initprot = initprot;
+        seg->maxprot = maxprot;
+    } else {
+        struct mach_header_64 *mach_header = (struct mach_header_64 *)header;
+        struct segment_command_64 *seg = macho_get_segment_by_name_64(mach_header, segname);
+        if (!seg) {
+            goto finish;
+        }
+
+        seg->initprot = initprot;
+        seg->maxprot = maxprot;
+    }
+
+//    kcgen_verboseLog(" --> SET %s to initprot:0x%X, maxprot:0x%X", segname, initprot, maxprot);
+    result = true;
+
+finish:
+    return result;
+}
+
+/*********************************************************************
+*********************************************************************/
 static boolean_t __OSKextSetSectionAddress(
     CFDataRef kernelImage, const char *segname, 
     const char *sectname, uint64_t loadAddr)
@@ -14631,6 +17926,441 @@ finish:
     return result;
 }
 
+
+/*********************************************************************
+ *********************************************************************/
+static Boolean __OSKextConvertExeOfstsToLinkedOfsts(OSKextRef aKext)
+{
+    uint32_t *kaslr_offsets;
+    uint32_t  kaslr_offsets_count;
+
+    /*
+     * Gather up info on each segment of the linked kext
+     */
+    SegInfo   linked_info[SEG_IDX_COUNT];
+    for (uint32_t i = 0; i < SEG_IDX_COUNT; i++) {
+        uint64_t seg_vmaddr, seg_vmsize, seg_fileoff;
+        char *segName = segIdxToName(i);
+        if (!__OSKextGetSegmentInfo(aKext->loadInfo->linkInfo.linkedKext,
+                                    segName, &seg_vmaddr, &seg_vmsize,
+                                    &seg_fileoff, NULL, NULL, true)) {
+            linked_info[i].vmaddr  = 0;
+            linked_info[i].vmsize  = 0;
+            linked_info[i].fileoff = 0;
+            continue;
+        }
+        linked_info[i].vmaddr  = seg_vmaddr;
+        linked_info[i].vmsize  = seg_vmsize;
+        linked_info[i].fileoff = seg_fileoff;
+    }
+
+    kaslr_offsets = aKext->loadInfo->linkInfo.kaslr_offsets;
+    kaslr_offsets_count = aKext->loadInfo->linkInfo.kaslr_offsets_count;
+
+    /* debugging... */
+    uint32_t __unused seg_ofst_count[SEG_IDX_COUNT] = {0};
+
+    kcgen_verboseLog("Converting %d offsets from exe -> linked", kaslr_offsets_count);
+    for (uint32_t i = 0; i < kaslr_offsets_count; i++) {
+        uint32_t          kaslr_ofst;
+        uint64_t          seg_ofst;
+        uint64_t          linked_ofst;
+        char              ofst_segname[MAX_SEGNAME_LEN];
+        uint64_t __unused exe_vmaddr;
+        uint64_t __unused exe_vmsize;
+        uint64_t __unused exe_fileoff;
+        uint64_t __unused exe_filesize;
+
+        enum enumSegIdx   seg_idx;
+
+        kaslr_ofst = kaslr_offsets[i];
+
+        /*
+         * kaslr_offsets values from kxld are offsets into the original (non linked) kext.
+         * Convert them into offsets into the linked kext
+         */
+        if (__OSKextGetSegmentInfoForOffset(aKext->loadInfo->linkInfo.kextExecutable,
+                                            (uint64_t)kaslr_ofst,
+                                            ofst_segname,
+                                            &seg_ofst,
+                                            &exe_vmaddr,
+                                            &exe_vmsize,
+                                            &exe_fileoff,
+                                            &exe_filesize) == false) {
+            char kextPath[PATH_MAX];
+            __OSKextGetFileSystemPath(aKext, NULL, false, kextPath);
+            OSKextLog(aKext,
+                      kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                      "kaslr could not find offset %u (%p) in kextExecutable '%s' <%s %d>",
+                      kaslr_ofst, (void *) ((uint64_t)kaslr_ofst),
+                      kextPath, __func__, __LINE__);
+            abort();
+        }
+
+        if (!getSegIndex(ofst_segname, &seg_idx)) {
+            OSKextLog(aKext,
+                      kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                      "Invalid/Unknown segment: %s <%s %d>",
+                      ofst_segname, __func__, __LINE__);
+            abort();
+        }
+
+        if (seg_idx == SEG_IDX_LINKEDIT) {
+            OSKextLog(aKext,
+                      kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                      "Offset[%d]:%u points to LINKEDIT! <%s %d>",
+                      i, kaslr_ofst, __func__, __LINE__);
+            abort();
+        }
+
+        /*
+         * 'seg_ofst' should now be the VA offset into the segment named 'ofst_segname'
+         * Convert this into a VA offset from the beginning of the linked kext.
+         */
+        if (linked_info[seg_idx].vmsize == 0) {
+            OSKextLog(aKext,
+                      kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                      "segment offset:%llu (exe fileoff:%llu) is in zero-sized segment '%s'? <%s %d>",
+                      seg_ofst, exe_fileoff, ofst_segname,
+                      __func__, __LINE__);
+            abort();
+        }
+
+        linked_ofst = linked_info[seg_idx].vmaddr + seg_ofst;
+        if (linked_ofst > linked_info[seg_idx].vmaddr + linked_info[seg_idx].vmsize) {
+            OSKextLog(aKext,
+                      kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                      "segment offset[%d]:%llu (exe fileoff:%llu) > %s: %llu + %llu, vmsize:%llu (kaslr_ofst:%u) <%s %d>",
+                      i, seg_ofst, exe_fileoff, ofst_segname, linked_info[seg_idx].vmaddr,
+                      linked_info[seg_idx].vmsize, linked_info[seg_idx].vmsize, kaslr_ofst,
+                      __func__, __LINE__);
+            abort();
+        }
+        /* convert to kext-relative offset */
+        linked_ofst -= linked_info[SEG_IDX_TEXT].vmaddr;
+
+        /* replace offset into the unlinked kext with offset into the linked kext */
+        kaslr_offsets[i] = (uint32_t)linked_ofst;
+
+        /* debugging info... */
+        seg_ofst_count[seg_idx]++;
+    } /* for each offset */
+
+    /* debugging output */
+    for (uint32_t i = 0; i < SEG_IDX_COUNT; i++) {
+        kcgen_verboseLog("\trelocs: %s:%d", segIdxToName(i), seg_ofst_count[i]);
+    }
+
+    return true;
+}
+
+
+/*********************************************************************
+*********************************************************************/
+static boolean_t
+__OSKextHandlePointersForASLR(OSKextRef aKext, plkInfo *plkInfo, u_char *prelinkData,
+                              uint64_t segKCOffsets[SEG_IDX_COUNT],
+                              uintptr_t *pointersForASLR, size_t numPointers)
+{
+    uint32_t        slideOffset;
+
+    /*
+     * Put all pointers which will need to be slid into one CFSet for all kexts.
+     * This will de-dupe references, and allow us to completely remove the
+     * LINKEDIT segment for all kexts.
+     */
+
+    if (pointersForASLR) {
+        assert(numPointers > 0);
+        kcgen_verboseLog("\tHandling %lu adjustment pointers for ASLR", numPointers);
+
+        /*
+         * deal with pointers from the adjustor (kext local)
+         */
+        for (size_t i = 0; i < numPointers; i++) {
+            uintptr_t       kcOffset;
+            CFNumberRef     cfnum = NULL; // must release
+
+            // calculate _file_ offset relative to the PRELINK_TEXT segment.
+            // The pointersForASLR values are relative to the beginning of the
+            // kernelache file
+            kcOffset = (*(pointersForASLR + i) - (uintptr_t)prelinkData);
+            slideOffset = kextcacheFileOffsetToPLKTEXTOffset((uint64_t)kcOffset, plkInfo);
+
+            cfnum = CFNumberCreate(kCFAllocatorDefault,
+                                   kCFNumberSInt32Type,
+                                   &slideOffset);
+            CFSetAddValue(plkInfo->kaslrOffsets, cfnum);
+            SAFE_RELEASE_NULL(cfnum);
+        }
+        free(pointersForASLR);
+    }
+
+    /*
+     * deal with relocation entries from KXLD (kext external)
+     */
+    if (aKext->loadInfo->linkInfo.kaslr_offsets) {
+        uint32_t *kaslr_offsets;
+        uint32_t  kaslr_offsets_count;
+
+        kaslr_offsets = aKext->loadInfo->linkInfo.kaslr_offsets;
+        kaslr_offsets_count = aKext->loadInfo->linkInfo.kaslr_offsets_count;
+        aKext->loadInfo->linkInfo.kaslr_offsets = NULL;
+        aKext->loadInfo->linkInfo.kaslr_offsets_count = 0;
+
+        /* debugging info... */
+        uint32_t seg_ofst_count[SEG_IDX_COUNT] = {0};
+
+        kcgen_verboseLog("\tHandling %d kxld reloc pointers for ASLR", kaslr_offsets_count);
+        for (uint32_t i = 0; i < kaslr_offsets_count; i++) {
+            uint32_t          kaslr_ofst;
+            CFNumberRef       cfnum = NULL; // must release
+            uint64_t          seg_ofst;
+            enum enumSegIdx   seg_idx;
+            char              seg_name[MAX_SEGNAME_LEN] = {0};
+            uint64_t          kcOffset;
+            uint64_t __unused seg_vmaddr;
+            uint64_t __unused seg_vmsize;
+            uint64_t __unused seg_fileoff;
+            uint64_t __unused seg_filesize;
+
+            /* kaslr_offsets at this point are VA offsets into the linked kext */
+            kaslr_ofst = kaslr_offsets[i];
+
+            /* find out which segment it's in and the offset into that segment */
+            if (__OSKextGetSegmentInfoForOffset(aKext->loadInfo->linkInfo.linkedKext,
+                                                (uint64_t)kaslr_ofst,
+                                                seg_name,
+                                                &seg_ofst,
+                                                &seg_vmaddr,
+                                                &seg_vmsize,
+                                                &seg_fileoff,
+                                                &seg_filesize) == false) {
+                OSKextLog(aKext,
+                          kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                          "kaslr could not find offset[%d] %u (%p) in linkedKext <%s %d>",
+                          i, kaslr_ofst, (void *)((uint64_t)kaslr_ofst), __func__, __LINE__);
+                abort();
+            }
+
+            if (!getSegIndex(seg_name, &seg_idx)) {
+                OSKextLog(aKext,
+                          kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                          "kaslr bad segment lookup (%s)!!! <%s %d>",
+                          seg_name, __func__, __LINE__);
+                abort();
+            }
+
+            if (seg_idx == SEG_IDX_LINKEDIT) {
+                OSKextLog(aKext,
+                          kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                          "kaslr offset[%d]:%u points into LINKEDIT segment! <%s %d>",
+                          i, kaslr_ofst, __func__, __LINE__);
+                abort();
+            }
+
+            assert(segKCOffsets[seg_idx] > 0);
+
+            /*
+             * NOTE (important):
+             * In the split kernel cache there is an equivalence between file and VM size (i.e. we don't
+             * squash zerofill segments within the kernelcache file). Because of this, the calculation
+             * to convert a VA kext offset to a KC file offset is straightforward: just add the VA segment
+             * offset (seg_ofst) to the KC segment starting point (segKCOffsets).
+             *
+             * If, in the future, we start to compress the binary file size of a kernel cache, we will
+             * need a more complicated calculation here!
+             */
+            kcOffset = segKCOffsets[seg_idx] + seg_ofst;
+
+            /*
+             * calculate the file/VA offset from beginning of PRELINK_TEXT for all kext
+             * addresses we need to slide
+             */
+            slideOffset = kextcacheFileOffsetToPLKTEXTOffset((uint64_t)kcOffset, plkInfo);
+
+            cfnum = CFNumberCreate(kCFAllocatorDefault,
+                                   kCFNumberSInt32Type,
+                                   &slideOffset);
+            CFSetAddValue(plkInfo->kaslrOffsets, cfnum);
+            SAFE_RELEASE_NULL(cfnum);
+
+            /* debugging */
+            seg_ofst_count[seg_idx]++;
+        }
+
+        for (uint32_t i = 0; i < SEG_IDX_COUNT; i++) {
+            kcgen_verboseLog("\t\trelocs: %s:%d", segIdxToName(i), seg_ofst_count[i]);
+        }
+
+        free(kaslr_offsets);
+    } /* if (kaslr_offsets) */
+
+    return true;
+}
+
+/*********************************************************************
+*********************************************************************/
+static boolean_t
+__OSKextCompactKext(OSKextRef aKext)
+{
+    splitKextLinkInfo *linkInfo;
+    struct mach_header_64 *kext_mh;
+    u_char *new_kext_mh;
+    struct load_command *lc;
+    size_t offset;
+
+    struct segment_command_64 *le_seg, *dc_seg;
+    size_t mh_sz = 0, new_kext_sz = 0;
+    uint32_t dc_ofst_diff = 0, le_ofst_diff = 0;
+
+    linkInfo = &aKext->loadInfo->linkInfo;
+    kext_mh = (struct mach_header_64 *)(linkInfo->linkedKext);
+
+    mh_sz = sizeof(*kext_mh) + kext_mh->sizeofcmds;
+
+    le_seg = macho_get_segment_by_name_64(kext_mh, SEG_LINKEDIT);
+    if (!le_seg) {
+        char kextPath[PATH_MAX];
+        __OSKextGetFileSystemPath(aKext, NULL, false, kextPath);
+        kcgen_verboseLog("Cannot compress %s: no LINKEDIT segment!", kextPath);
+        return false;
+    }
+
+    new_kext_sz = mh_sz + le_seg->vmsize;
+
+    /* LINKEDIT file offset difference */
+    le_ofst_diff = (uint32_t)((uint64_t)le_seg->fileoff - (uint64_t)mh_sz);
+
+    /* we need to bring along DATA_CONST for IOKit vtables */
+    dc_seg = macho_get_segment_by_name_64(kext_mh, SEG_DATA_CONST);
+    if (dc_seg) {
+        new_kext_sz += dc_seg->vmsize;
+        dc_ofst_diff = (uint32_t)((uint64_t)dc_seg->fileoff - (mh_sz + le_seg->vmsize));
+    }
+
+
+    /* allocate the new, compressed, kext */
+    new_kext_mh = (u_char *)malloc(new_kext_sz);
+    /* copy macho load commands */
+    memcpy(new_kext_mh, kext_mh, mh_sz);
+    /* copy linkedit segment */
+    memcpy(new_kext_mh + mh_sz, linkInfo->linkedKext + le_seg->fileoff, le_seg->vmsize);
+
+    if (__OSKextShouldLog(aKext, kOSKextLogDebugLevel | kOSKextLogGeneralFlag)) {
+        char kextPath[PATH_MAX];
+        __OSKextGetFileSystemPath(aKext, NULL, false, kextPath);
+        kcgen_verboseLog("Compressing: %lld -> %lu bytes [%p-%p]",
+                         (uint64_t)linkInfo->linkedKextSize, new_kext_sz,
+                         (void *)new_kext_mh, (void *)(new_kext_mh + new_kext_sz));
+    }
+
+    /* le_seg now points into the newly allocated kext */
+    le_seg = macho_get_segment_by_name_64((struct mach_header_64 *)new_kext_mh, SEG_LINKEDIT);
+    kcgen_verboseLog("\t__LINKEDIT %llu -> %llu (%llu bytes)", le_seg->fileoff, le_seg->fileoff - le_ofst_diff, le_seg->vmsize);
+    le_seg->fileoff -= le_ofst_diff;
+
+    if (dc_seg) {
+        /* copy the data const segment */
+        memcpy(new_kext_mh + mh_sz + le_seg->vmsize,
+               linkInfo->linkedKext + dc_seg->fileoff, dc_seg->vmsize);
+        /* dc_seg now points into the newly allocated kext */
+        dc_seg = macho_get_segment_by_name_64((struct mach_header_64 *)new_kext_mh, SEG_DATA_CONST);
+        kcgen_verboseLog("\t__DATA_CONST %llu -> %llu (%llu bytes)", dc_seg->fileoff, dc_seg->fileoff - dc_ofst_diff, dc_seg->filesize);
+        dc_seg->fileoff -= dc_ofst_diff;
+    }
+
+    #define adj_off(_cmd, _member, _ofst) \
+            if ((_cmd)->_member > _ofst) { \
+                (_cmd)->_member = (__typeof__((_cmd)->_member))((uint32_t)((_cmd)->_member) - _ofst); \
+                kcgen_verboseLog("\t\t    [%s] %s->%s = %d", getSegmentCommandName(lc->cmd), \
+                                 #_cmd, #_member, (uint32_t)((_cmd)->_member)); \
+            }
+
+    /*
+     * Here's the tricky part - run through each load command and make this smaller, more compact, kext a (mostly) valid
+     * macho.  More specifically, make it valid enough for kxld to find all the symbols.
+     */
+    offset = sizeof(*kext_mh);
+    for (unsigned i = 0; i < ((struct mach_header_64 *)new_kext_mh)->ncmds; ++i) {
+        lc = (struct load_command *)(new_kext_mh + offset);
+        switch (lc->cmd) {
+        case LC_SEGMENT_64: {
+            struct segment_command_64 *seg_cmd = (struct segment_command_64 *)lc;
+            struct section_64 *sect = NULL;
+            sect = (struct section_64 *)(&seg_cmd[1]);
+            if (strcmp(seg_cmd->segname, SEG_LINKEDIT) != 0 && strcmp(seg_cmd->segname, SEG_DATA_CONST) != 0) {
+                /* make non-LINKEDIT/DATA_CONST segments look like zero-fill */
+                seg_cmd->fileoff = 0;
+                seg_cmd->filesize = 0;
+            }
+            kcgen_verboseLog("\t\tseg %s (%u sects), fileoff:%lld",
+                             seg_cmd->segname, seg_cmd->nsects, seg_cmd->fileoff);
+            for (uint32_t j = 0; j < seg_cmd->nsects; ++j, ++sect) {
+                if (seg_cmd->filesize == 0) {
+                    sect->offset = 0;
+                    sect->reloff = 0;
+                    sect->nreloc = 0;
+                    sect->size = 0;
+                    sect->flags |= S_ZEROFILL;
+                } else {
+                    adj_off(sect, offset, dc_ofst_diff);
+                    adj_off(sect, reloff, le_ofst_diff);
+                }
+                kcgen_verboseLog("\t\t    `->sect %s offset:%d, reloff:%d (%d relocs)", sect->sectname, sect->offset, sect->reloff, sect->nreloc);
+            }
+            } break;
+        case LC_SYMTAB: {
+            /* adjust symtab offsets to point into the new LINKEDIT location */
+            struct symtab_command *symtab_cmd = (struct symtab_command *)lc;
+            adj_off(symtab_cmd, symoff, le_ofst_diff);
+            adj_off(symtab_cmd, stroff, le_ofst_diff);
+            } break;
+        case LC_DYSYMTAB: {
+            /* adjust dysymtab offsets to point into the new LINKEDIT location */
+            struct dysymtab_command *dstab_cmd = (struct dysymtab_command *)lc;
+            adj_off(dstab_cmd, tocoff, le_ofst_diff);
+            adj_off(dstab_cmd, modtaboff, le_ofst_diff);
+            adj_off(dstab_cmd, extrefsymoff, le_ofst_diff);
+            adj_off(dstab_cmd, indirectsymoff, le_ofst_diff);
+            adj_off(dstab_cmd, extreloff, le_ofst_diff);
+            adj_off(dstab_cmd, locreloff, le_ofst_diff);
+            } break;
+        case LC_SEGMENT_SPLIT_INFO: {
+            /* adjust split segment info offsets to point into the new LINKEDIT location */
+            struct linkedit_data_command *ldc = (struct linkedit_data_command *)lc;
+            adj_off(ldc, dataoff, le_ofst_diff);
+            } break;
+        }
+        offset += lc->cmdsize;
+    } /* for each load command */
+
+    /* drop kext memory */
+    if (aKext->loadInfo->linkedExecutable) {
+        SAFE_RELEASE(aKext->loadInfo->linkedExecutable);
+    }
+    if (aKext->loadInfo->prelinkedExecutable) {
+        SAFE_RELEASE(aKext->loadInfo->prelinkedExecutable);
+    }
+    SAFE_FREE(linkInfo->linkedKext);
+
+    /* create a new CFData object using the compacted kext */
+    aKext->loadInfo->linkedExecutable = CFDataCreateWithBytesNoCopy(CFGetAllocator(aKext),
+                                                                    new_kext_mh,
+                                                                    new_kext_sz,
+                                                                    kCFAllocatorMalloc);
+    aKext->loadInfo->prelinkedExecutable = CFRetain(aKext->loadInfo->linkedExecutable);
+
+    /* this pointer is the raw malloced data */
+    linkInfo->linkedKext = new_kext_mh;
+
+    /* leave the old linkedKextSize value - it's used in other calculations */
+    /* linkInfo->linkedKextSize = new_kext_sz; */
+
+    return true;
+}
+
+
 /*********************************************************************
 *********************************************************************/
 #define FAKE_32BIT_LOAD_ADDRESS  (0x10000000)
@@ -14679,7 +18409,7 @@ static uint64_t __OSKextGetFakeLoadAddress(CFDataRef kernelImage)
         goto finish;
     }
 
-    textSegment = macho_get_segment_by_name_64(machHeader, "__TEXT");
+    textSegment = macho_get_segment_by_name_64(machHeader, SEG_TEXT);
     if (!textSegment) {
         OSKextLog(/* kext */ NULL, kOSKextLogErrorLevel | kOSKextLogFileAccessFlag,
             "Can't find text segment in kernel file.");
@@ -14699,19 +18429,219 @@ finish:
     return result;
 }
 
+
 /*********************************************************************
 *********************************************************************/
+static void __OSKextRemovePLKLinkedit(plkInfo *plkInfo)
+{
+    CFMutableDataRef prelinkImage = plkInfo->kernelCacheImage;
+    CFIndex prelinkSize = CFDataGetLength(prelinkImage);
+
+    /*
+     * We want to remove the entire PLK_LINKEDIT segment from the kernel
+     * cache. We know that the PLK_LINKEDIT segment is the _last_ segment
+     * in the kernel cache, and that we will dynamically grow the kernel
+     * cache for the PRELINK_INFO segment. We also have an equivalence
+     * between vmsize and file size.
+     */
+    uint64_t vmaddr = getKCPlkSegVMAddr(plkInfo, SEG_IDX_LINKEDIT);
+    uint64_t vmsize = getKCPlkSegVMSize(plkInfo, SEG_IDX_LINKEDIT);
+    uint64_t fileoff = getKCPlkSegFileOff(plkInfo, SEG_IDX_LINKEDIT);
+
+    /* truncate the in-memory structure */
+    prelinkSize -= (CFIndex)vmsize;
+    CFDataSetLength(prelinkImage, prelinkSize);
+
+    /* reset the PLK_LINKEDIT segment info */
+    setKCPlkSegVMSize(plkInfo, SEG_IDX_LINKEDIT, 0);
+
+    /* setup the PRELINK_INFO segment to start where LINKEDIT used to start */
+    struct SegInfo *seg_info = &plkInfo->plk_INFO;
+    seg_info->vmaddr = vmaddr;
+    seg_info->fileoff = fileoff;
+}
+
+
+/*********************************************************************
+*********************************************************************/
+static CFArrayRef __OSKextPrelinkSplitKexts(
+                                            CFArrayRef       kextArray,
+                                            plkInfo *        plkInfo,
+                                            KXLDContext *    kxldContext,
+                                            Boolean          needAllFlag,
+                                            Boolean          skipAuthenticationFlag,
+                                            Boolean          printDiagnosticsFlag,
+                                            Boolean          stripSymbolsFlag)
+{
+    CFArrayRef        result   = NULL;
+    boolean_t         success  = false;
+    CFMutableArrayRef loadList = NULL;
+
+    OSKextLogSpec     linkLogLevel;
+    char            * kextIdentifierCString = NULL;  // must free
+    CFIndex           i;
+    int               badLinkCount = 0;
+
+    u_char *prelinkData;
+    CFIndex prelinkDataSize;
+    
+    linkLogLevel = needAllFlag ? kOSKextLogErrorLevel : kOSKextLogWarningLevel;
+    
+    /* Calculate the load list for the set of kexts. If needAllFlag is false,
+     * then kexts whose dependencies do not resolve will fail to link and will
+     * be excluded from the cache, while all others will get prelinked.
+     */
+    
+    loadList = OSKextCopyLoadListForKexts(kextArray, needAllFlag);
+    if (!loadList) {
+        OSKextLog(/* kext */ NULL, kOSKextLogErrorLevel,
+                  "Can't resolve dependencies amongst kexts for prelinked kernel.");
+        goto finish;
+    }
+    
+    for (i = 0; i < CFArrayGetCount(loadList); ++i) {
+        OSKextRef aKext = (OSKextRef) CFArrayGetValueAtIndex(loadList, i);
+        
+        if (!__OSKextCheckForPrelinkedKernel(aKext, needAllFlag,
+                                             skipAuthenticationFlag, printDiagnosticsFlag)) {
+            
+            if (needAllFlag) {
+                OSKextLog(/* kext */ aKext, linkLogLevel | kOSKextLogLinkFlag,
+                          "Aborting prelink.");
+                goto finish;
+            } else {
+                CFArrayRemoveValueAtIndex(loadList, i--);
+            }
+        }
+    }
+    
+    /* Link each kext in the load list */
+    
+    for (i = 0; i < CFArrayGetCount(loadList); ++i) {
+        uint64_t orig_vmaddrs[SEG_IDX_COUNT], vmaddrs[SEG_IDX_COUNT], kc_offs[SEG_IDX_COUNT], sizes[SEG_IDX_COUNT];
+
+        OSKextRef aKext = (OSKextRef) CFArrayGetValueAtIndex(loadList, i);
+        
+        SAFE_FREE_NULL(kextIdentifierCString);
+        
+        if (!OSKextDeclaresExecutable(aKext)) {
+            continue;
+        }
+        
+        kextIdentifierCString =
+        createUTF8CStringForCFString(OSKextGetIdentifier(aKext));
+        
+        /*
+         * Record the original segment address
+         */
+        for (enum enumSegIdx idx = SEG_IDX_TEXT; idx < SEG_IDX_COUNT; ++idx) {
+                orig_vmaddrs[idx] = getKextVMAddr(aKext, idx);
+        }
+        /* Set the load address of the kext.
+         */
+
+        /* Perform the link operation. Note we pass 0 for the
+         * kernelLoadAddress because we should have a valid address
+         * set for every kext when doing a prelinked kernel.
+         */
+        success = __OSKextPerformSplitLink(aKext,
+                                           plkInfo,
+                                           kxldContext);
+        
+        if (!success) {
+            if ( needAllFlag == false ) {
+                if (OSKextMatchesRequiredFlags(aKext,
+                                               kOSKextOSBundleRequiredRootFlag |
+                                               kOSKextOSBundleRequiredLocalRootFlag |
+                                               kOSKextOSBundleRequiredNetworkRootFlag |
+                                               kOSKextOSBundleRequiredDriverKitFlag)) {
+                    /* This is a "rooting" kext, if we have more than a few of
+                     * these fail to link then something bad has happened with
+                     * our environment, abort the prelink.  13080154
+                     */
+                    if (++badLinkCount > 3) {
+                        needAllFlag = true;
+                        linkLogLevel = kOSKextLogErrorLevel;
+                    }
+                }
+            }
+            OSKextLog(/* kext */ aKext, linkLogLevel | kOSKextLogLinkFlag,
+                      "Prelink failed for %s; %s.",
+                      kextIdentifierCString,
+                      needAllFlag ? "aborting prelink" : "omitting from prelinked kernel");
+            if (needAllFlag) {
+                goto finish;
+            }
+            CFArrayRemoveValueAtIndex(loadList, i--);
+            continue;
+        }
+
+        if (nSplitKexts) {
+            assert(nNonSplitKexts == 0);
+            bzero(sizes, sizeof(sizes));
+
+            for (enum enumSegIdx idx = SEG_IDX_TEXT; idx < SEG_IDX_COUNT; ++idx) {
+                uint64_t va_base = getKCPlkSegVMAddr(plkInfo, idx);
+                uint64_t kc_base = getKCPlkSegFileOff(plkInfo, idx);
+
+                vmaddrs[idx] = getKextVMAddr(aKext, idx);
+                kc_offs[idx] = kc_base + (vmaddrs[idx] - va_base);
+                kcgen_verboseLog("seg %s va_base %llx vmaddr %llx kc_base %llx kc_off %llx", 
+                                 segIdxToName(idx), va_base, vmaddrs[idx], kc_base, kc_offs[idx]);
+            }
+
+            prelinkData = CFDataGetMutableBytePtr(plkInfo->kernelCacheImage);
+            prelinkDataSize = CFDataGetLength(plkInfo->kernelCacheImage);
+
+            if (!__OSKextCopyToPLK(aKext, plkInfo, prelinkData, prelinkDataSize, orig_vmaddrs, vmaddrs, kc_offs, sizes, stripSymbolsFlag)) {
+                OSKextLog(/* kext */ aKext, linkLogLevel | kOSKextLogLinkFlag,
+                          "%s %d Aborting prelink.",
+                          __func__, __LINE__);
+                goto finish;
+            }
+
+        } else {
+            assert(nSplitKexts == 0);
+            if (!__OSKextOldCopyToPLK(aKext, plkInfo, stripSymbolsFlag)) {
+                OSKextLog(/* kext */ aKext, linkLogLevel | kOSKextLogLinkFlag,
+                          "%s %d Aborting prelink.",
+                          __func__, __LINE__);
+                goto finish;
+            }
+        }
+
+    } // kext loadList for loop
+
+    if (stripSymbolsFlag && nSplitKexts != 0) {
+        /*
+         * When linking split kexts, we can actually remove _all_
+         * of the PLK_LINKEDIT segment: we've saved off all relocations
+         * that need to be slid, and we don't want symbols at runtime.
+         */
+        kcgen_verboseLog("Stripping symbols and " kPrelinkLinkeditSegment "...");
+        __OSKextRemovePLKLinkedit(plkInfo);
+    }
+
+    result = CFRetain(loadList);
+
+finish:
+    SAFE_RELEASE(loadList);
+    SAFE_FREE(kextIdentifierCString);
+    return result;
+}
+
+
 static CFArrayRef __OSKextPrelinkKexts(
-    CFArrayRef        kextArray,
-    CFDataRef         kernelImage,
-    uint64_t          loadAddrBase,
-    uint64_t          sourceAddrBase,
-    KXLDContext     * kxldContext,
-    u_long          * loadSizeOut,
-    Boolean           needAllFlag,
-    Boolean           skipAuthenticationFlag,
-    Boolean           printDiagnosticsFlag,
-    Boolean           stripSymbolsFlag)
+                                       CFArrayRef        kextArray,
+                                       CFDataRef         kernelImage,
+                                       uint64_t          loadAddrBase,
+                                       uint64_t          sourceAddrBase,
+                                       KXLDContext     * kxldContext,
+                                       u_long          * loadSizeOut,
+                                       Boolean           needAllFlag,
+                                       Boolean           skipAuthenticationFlag,
+                                       Boolean           printDiagnosticsFlag,
+                                       Boolean           stripSymbolsFlag)
 {
     CFArrayRef        result   = NULL;
     boolean_t         success  = false;
@@ -14770,29 +18700,40 @@ static CFArrayRef __OSKextPrelinkKexts(
 
        /* Set the load address of the kext.
         */
+
         loadAddr = loadAddrBase + loadSize;
         sourceAddr = sourceAddrBase + loadSize;
         
-       /* OSKextSetLoadAddress() creates aKext->loadInfo.
-        */
+        /* OSKextSetLoadAddress() creates aKext->loadInfo.
+         */
         OSKextSetLoadAddress(aKext, loadAddr);
         aKext->loadInfo->sourceAddress = sourceAddr;
 
-       /* Perform the link operation. Note we pass 0 for the
-        * kernelLoadAddress because we should have a valid address
-        * set for every kext when doing a prelinked kernel.
-        */
+        /* Perform the link operation. Note we pass 0 for the
+         * kernelLoadAddress because we should have a valid address
+         * set for every kext when doing a prelinked kernel.
+         *
+         * Driver extensions don't declare a kernel executable,
+         * so linking should always succeed, but put it here for
+         * good measure should something change in the future.
+         */
         success = __OSKextPerformLink(aKext, kernelImage,
-            /* kernelLoadAddress */ 0, stripSymbolsFlag, kxldContext);
+                                      /* kernelLoadAddress */ 0, stripSymbolsFlag, kxldContext);
+
         if (!success) {
             if ( needAllFlag == false ) {
                 if (OSKextMatchesRequiredFlags(aKext,
                                     kOSKextOSBundleRequiredRootFlag |
                                     kOSKextOSBundleRequiredLocalRootFlag |
-                                    kOSKextOSBundleRequiredNetworkRootFlag)) {
+                                    kOSKextOSBundleRequiredNetworkRootFlag |
+                                    kOSKextOSBundleRequiredDriverKitFlag)) {
                     /* This is a "rooting" kext, if we have more than a few of
                      * these fail to link then something bad has happened with
                      * our environment, abort the prelink.  13080154
+                     *
+                     * Driver extensions don't declare a kernel executable,
+                     * so linking should always succeed, but put it here for
+                     * good measure should something change in the future.
                      */
                     if (++badLinkCount > 3) {
                         needAllFlag = true;
@@ -14811,10 +18752,11 @@ static CFArrayRef __OSKextPrelinkKexts(
             continue;
         }
 
-        loadSize += roundPageCrossSafe(aKext->loadInfo->loadSize);
-    }
+        loadSize += roundPageCrossSafe(aKext->loadInfo->linkInfo.linkedKextSize);
+    } // kext loadList for loop
 
     result = CFRetain(loadList);
+    
     *loadSizeOut = loadSize;
 
 finish:
@@ -14823,12 +18765,21 @@ finish:
     return result;
 }
 
+typedef struct kaslrPackedOffsets {
+    uint32_t count;              /* number of offsets */
+    uint32_t offsetsArray[];     /* offsets to slide */
+} kaslrPackedOffsets;
+
+
 /*********************************************************************
 *********************************************************************/
 static CFDataRef __OSKextCreatePrelinkInfoDictionary(
+    plkInfo   *plkInfo,
     CFArrayRef loadList,
     CFURLRef   volumeRootURL,
-    Boolean    includeAllPersonalities)
+    Boolean    includeAllPersonalities,
+    Boolean    isSplitKexts,
+    CFDataRef  kernelUUID)
 {
     CFDataRef                   result                  = NULL; // do not release
 
@@ -14847,9 +18798,11 @@ static CFDataRef __OSKextCreatePrelinkInfoDictionary(
     CFStringRef                 archPersonalitiesKey    = NULL; // must release
     CFSetRef                    loadListIDs             = NULL; // must release
     char                      * kextVolPath             = NULL; // do not free
-    int64_t                     num                     = 0;
     int                         i                       = 0;
     int                         count                   = 0;
+    CC_SHA256_CTX               ctx;
+    unsigned char               kernelCacheHash[CC_SHA256_DIGEST_LENGTH];
+    CFDataRef                   kcID                    = NULL; // must release
 
     /* Get the C string for the volume root URL. */
 
@@ -14892,6 +18845,50 @@ static CFDataRef __OSKextCreatePrelinkInfoDictionary(
         goto finish;
     }
 
+    /* Save all the kext KASLR slide offsets to be fixed up at boot */
+    int offsets = 0;
+    if (isSplitKexts && plkInfo->kaslrOffsets && (offsets = CFSetGetCount(plkInfo->kaslrOffsets))) {
+        kaslrPackedOffsets *    myPackedOffsets = NULL;
+        int                     mySize;
+        CFDataRef               kaslrOffsetsData = NULL;
+
+        mySize = sizeof(*myPackedOffsets) + (offsets * sizeof(uint32_t));
+
+        myPackedOffsets = (kaslrPackedOffsets *) malloc(mySize);
+        if (myPackedOffsets == NULL) {
+            OSKextLogMemError();
+            goto finish;
+        }
+
+        myPackedOffsets->count = 0;
+
+        // stuff each offset into our kaslrPackedOffsets struct
+        CFSetApplyFunction(plkInfo->kaslrOffsets, (CFSetApplierFunction)__OSKextPackKASLROffsets, myPackedOffsets);
+        if (myPackedOffsets->count == 0) {
+            OSKextLogMemError();
+            goto finish;
+        }
+
+        CFRelease(plkInfo->kaslrOffsets);
+        plkInfo->kaslrOffsets = NULL;
+
+        kaslrOffsetsData = CFDataCreate(kCFAllocatorDefault, (const UInt8 *)myPackedOffsets, mySize);
+        if (kaslrOffsetsData == NULL) {
+            OSKextLogMemError();
+            goto finish;
+        }
+
+        CFDictionarySetValue(prelinkInfoDict,
+                             CFSTR(kPrelinkLinkKASLROffsetsKey),
+                             kaslrOffsetsData);
+        free(myPackedOffsets);
+    }
+
+    CC_SHA256_Init(&ctx);
+    if (kernelUUID) {
+        CC_SHA256_Update(&ctx, (unsigned char*) CFDataGetBytePtr(kernelUUID), CFDataGetLength(kernelUUID));
+    }
+
     /* Create an info dictionary for each kext in the load list */
 
     count = CFArrayGetCount(loadList);
@@ -14925,43 +18922,119 @@ static CFDataRef __OSKextCreatePrelinkInfoDictionary(
          * with the boot process.  These kexts will still be prelinked, and
          * they will be started when kextd is up and passes personalities for
          * all kexts to the kernel.
+         *
+         * Otherwise, if the kext will be included, modify it as specified
+         * (if at all) by the client.
          */
-        if (!includeAllPersonalities) {
-            if (!__OSKextRequiredAtEarlyBoot(aKext)) {
-                CFDictionaryRemoveValue(kextInfoDict, CFSTR(kIOKitPersonalitiesKey));
-                CFDictionaryRemoveValue(kextInfoDict, archPersonalitiesKey);
+        CFDictionaryRef personalities = CFDictionaryGetValue(kextInfoDict, CFSTR(kIOKitPersonalitiesKey));
+
+        if (!includeAllPersonalities && !__OSKextRequiredAtEarlyBoot(aKext)) {
+            CFDictionaryRemoveValue(kextInfoDict, CFSTR(kIOKitPersonalitiesKey));
+            CFDictionaryRemoveValue(kextInfoDict, archPersonalitiesKey);
+        } else if (personalities && CFDictionaryGetCount(personalities)) {
+            /* Modify the existing personalities going into the PLK - clients may have set
+             * __sOSKextPersonalityPatcherFunction. */
+
+            __OSKextPersonalityPatcherContext context;
+            context.kext               = aKext;
+            context.personalityNames   = NULL;
+            context.personalitiesArray = NULL;
+            context.personalitiesDict  = CFDictionaryCreateMutable(kCFAllocatorDefault,
+                                            CFDictionaryGetCount(personalities),
+                                            &kCFTypeDictionaryKeyCallBacks,
+                                            &kCFTypeDictionaryValueCallBacks);
+            context.includeBundleIDs   = false;
+            if (!context.personalitiesDict) {
+                OSKextLogMemError();
+                goto finish;
             }
+
+            CFDictionaryApplyFunction(personalities,
+                __OSKextPersonalityPatcherApplierFunction,
+                &context);
+
+            CFDictionarySetValue(kextInfoDict, CFSTR(kIOKitPersonalitiesKey), context.personalitiesDict);
         }
 
         /* Add the load address, source address, and kmod info address information.
          */
         if (OSKextDeclaresExecutable(aKext)) {
-            cfnum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type,
-                &aKext->loadInfo->loadAddress);
-            if (!cfnum) {
-                OSKextLogMemError();
-                goto finish;
-            }
-            CFDictionarySetValue(kextInfoDict, CFSTR(kPrelinkExecutableLoadKey), cfnum);
-            SAFE_RELEASE_NULL(cfnum);
+            if (isSplitKexts) {
+                int64_t kextExecSize = (int64_t)(aKext->loadInfo->linkInfo.linkedKextSize);
 
-            cfnum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type,
-                &aKext->loadInfo->sourceAddress);
-            if (!cfnum) {
-                OSKextLogMemError();
-                goto finish;
-            }
-            CFDictionarySetValue(kextInfoDict, CFSTR(kPrelinkExecutableSourceKey), cfnum);
-            SAFE_RELEASE_NULL(cfnum);
+                cfnum = CFNumberCreate(kCFAllocatorDefault,
+                                      kCFNumberSInt64Type,
+                                       &aKext->loadInfo->linkInfo.vmaddr_TEXT);
+                if (!cfnum) {
+                    OSKextLogMemError();
+                    goto finish;
+                }
 
-            num = CFDataGetLength(aKext->loadInfo->prelinkedExecutable);
-            cfnum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &num);
-            if (!cfnum) {
-                OSKextLogMemError();
-                goto finish;
+                CFDictionarySetValue(kextInfoDict, CFSTR(kPrelinkExecutableLoadKey), cfnum);
+
+                // same value for kPrelinkExecutableLoadKey and kPrelinkExecutableSourceKey
+                CFDictionarySetValue(kextInfoDict, CFSTR(kPrelinkExecutableSourceKey), cfnum);
+                SAFE_RELEASE_NULL(cfnum);
+
+                // use only the TEXT segment of a split kext for the PrelinkExecutableSizeKey value
+                if (aKext->loadInfo->linkInfo.vmaddr_TEXT_EXEC) {
+                    struct mach_header_64 * kextHeader = (struct mach_header_64 *)(aKext->loadInfo->linkInfo.linkedKext);
+                    struct segment_command_64 *seg_cmd;
+                    seg_cmd = macho_get_segment_by_name_64(kextHeader, SEG_TEXT);
+                    if (seg_cmd)
+                        kextExecSize = (int64_t)(seg_cmd->vmsize);
+                }
+
+                cfnum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &kextExecSize);
+                if (!cfnum) {
+                    OSKextLogMemError();
+                    goto finish;
+                }
+
+                CFDictionarySetValue(kextInfoDict, CFSTR(kPrelinkExecutableSizeKey), cfnum);
+                SAFE_RELEASE_NULL(cfnum);
+
+                // Update the KC ID based on the start addresses of each segment in the KEXT
+                uint64_t seg_addr = 0;
+                for (enum enumSegIdx idx = SEG_IDX_TEXT; idx < SEG_IDX_COUNT; ++idx) {
+                    seg_addr = getKextVMAddr(aKext, idx);
+                    CC_SHA256_Update(&ctx, &seg_addr, sizeof(seg_addr));
+                }
             }
-            CFDictionarySetValue(kextInfoDict, CFSTR(kPrelinkExecutableSizeKey), cfnum);
-            SAFE_RELEASE_NULL(cfnum);
+            else {
+                cfnum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type,
+                                       &aKext->loadInfo->linkInfo.vmaddr_TEXT);
+                if (!cfnum) {
+                    OSKextLogMemError();
+                    goto finish;
+                }
+                CFDictionarySetValue(kextInfoDict, CFSTR(kPrelinkExecutableLoadKey), cfnum);
+                SAFE_RELEASE_NULL(cfnum);
+
+                cfnum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type,
+                                       &aKext->loadInfo->sourceAddress);
+
+                if (!cfnum) {
+                    OSKextLogMemError();
+                    goto finish;
+                }
+                CFDictionarySetValue(kextInfoDict, CFSTR(kPrelinkExecutableSourceKey), cfnum);
+                SAFE_RELEASE_NULL(cfnum);
+
+                u_long num;
+                num = CFDataGetLength(aKext->loadInfo->prelinkedExecutable);
+                cfnum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &num);
+                if (!cfnum) {
+                    OSKextLogMemError();
+                    goto finish;
+                }
+                CFDictionarySetValue(kextInfoDict, CFSTR(kPrelinkExecutableSizeKey), cfnum);
+                SAFE_RELEASE_NULL(cfnum);
+
+                // Update the KC ID based on the start address of the KEXT
+                CC_SHA256_Update(&ctx, &aKext->loadInfo->linkInfo.vmaddr_TEXT,
+                                 sizeof(aKext->loadInfo->linkInfo.vmaddr_TEXT));
+            }
 
             cfnum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type,
                 &aKext->loadInfo->kmodInfoAddress);
@@ -14973,15 +19046,17 @@ static CFDataRef __OSKextCreatePrelinkInfoDictionary(
             SAFE_RELEASE_NULL(cfnum);
         }
 
-       /* If this is an interface kext, add its UUID.
-        */
-        if (OSKextDeclaresExecutable(aKext) && OSKextIsInterface(aKext)) {
-            uuid = OSKextCopyUUIDForArchitecture(aKext, OSKextGetArchitecture());
-            if (uuid) {
+        uuid = OSKextCopyUUIDForArchitecture(aKext, OSKextGetArchitecture());
+        if (uuid) {
+            /* Add UUID to KC ID hash */
+            CC_SHA256_Update(&ctx, CFDataGetBytePtr(uuid), CFDataGetLength(uuid));
+
+            /* If this is an interface kext, add its UUID. */
+            if (OSKextDeclaresExecutable(aKext) && OSKextIsInterface(aKext)) {
                 CFDictionarySetValue(kextInfoDict, CFSTR(kPrelinkInterfaceUUIDKey),
                     uuid);
-                SAFE_RELEASE_NULL(uuid);
             }
+            SAFE_RELEASE_NULL(uuid);
         }
 
        /* Add the kext's absolute path on the volume to the kernelcache.
@@ -15019,6 +19094,21 @@ static CFDataRef __OSKextCreatePrelinkInfoDictionary(
         CFArrayAppendValue(kextInfoDictArray, kextInfoDict);
     }
 
+    CC_SHA256_Final((unsigned char*)&kernelCacheHash, &ctx);
+    kcID = CFDataCreate(kCFAllocatorDefault, kernelCacheHash, sizeof(uuid_t));
+    if (kcID) {
+        /* Add the kernelcache ID */
+        CFDictionarySetValue(prelinkInfoDict, CFSTR(kPrelinkInfoKCIDKey), kcID);
+
+        printf("KernelCache ID: ");
+        for (unsigned long i = 0; i < sizeof(kernelCacheHash)/2; i++)  {
+            printf("%02X", kernelCacheHash[i]);
+        }
+        printf("\n");
+    } else {
+        kcgen_verboseLog("Failed to allocate kernelcache ID");
+    }
+
     /* Serialize the info dictionary */
 
     prelinkInfoData = IOCFSerialize(prelinkInfoDict, kNilOptions);
@@ -15035,6 +19125,7 @@ finish:
     SAFE_RELEASE(kextInfoDictArray);
     SAFE_RELEASE(prelinkInfoData);
     SAFE_RELEASE(uuid);
+    SAFE_RELEASE(kcID);
     SAFE_RELEASE(kextInfoDict);
     SAFE_RELEASE(prelinkInfoDict);
     SAFE_RELEASE(cfnum);
@@ -15043,6 +19134,21 @@ finish:
     SAFE_RELEASE(archPersonalitiesKey);
     SAFE_RELEASE(loadListIDs);
     return result;
+}
+
+/*********************************************************************
+ *********************************************************************/
+static void __OSKextPackKASLROffsets(CFNumberRef value, void *context)
+{
+    kaslrPackedOffsets *    myPackedOffsets = (kaslrPackedOffsets *) context;
+    uint32_t                myOffset;
+
+    // each value in the kaslrOffsets set is a 32 bit offset into the plk_TEXT
+    // segment (stored in a CFNumber)
+    if (CFNumberGetValue(value, kCFNumberSInt32Type, (SInt32 *)&myOffset)) {
+        myPackedOffsets->offsetsArray[myPackedOffsets->count++] = myOffset;
+    }
+    return;
 }
 
 /*********************************************************************
@@ -15056,7 +19162,7 @@ __OSKextRequiredAtEarlyBoot(
     bundleRequired = (CFStringRef)OSKextGetValueForInfoDictionaryKey(theKext,
         CFSTR(kOSBundleRequiredKey));
 
-    return (bundleRequired && kCFCompareEqualTo != 
+    return (bundleRequired && kCFCompareEqualTo !=
         CFStringCompare(bundleRequired, CFSTR(kOSBundleRequiredSafeBoot), 0));
 }
 
@@ -15166,10 +19272,10 @@ finish:
 /*********************************************************************
 *********************************************************************/
 static u_long __OSKextCopyPrelinkedKexts(
-    CFMutableDataRef prelinkImage,
-    CFArrayRef       loadList,
-    u_long           fileOffsetBase,
-    uint64_t         sourceAddrBase)
+                                         CFMutableDataRef prelinkImage,
+                                         CFArrayRef       loadList,
+                                         u_long           fileOffsetBase,
+                                         uint64_t         sourceAddrBase)
 {
     boolean_t   success     = false;
     u_char    * prelinkData = CFDataGetMutableBytePtr(prelinkImage);
@@ -15245,76 +19351,174 @@ static u_long __OSKextCopyPrelinkedKexts(
         goto finish;
     }
 
+
 finish:
     return totalSize;
 }
 
-
 /*********************************************************************
-*********************************************************************/
+ *********************************************************************/
+static Boolean __OSKextCopySplitPrelinkInfoDictionary(
+    plkInfo  *  plkInfo,
+    CFDataRef   prelinkInfoData)
+{
+    Boolean     success = false;
+    u_char *    kernelCacheData = CFDataGetMutableBytePtr(plkInfo->kernelCacheImage);
+    u_long      size = CFDataGetLength(prelinkInfoData);
+    
+    memcpy(kernelCacheData + plkInfo->plk_INFO.fileoff,
+           CFDataGetBytePtr(prelinkInfoData), size);
+    
+#if SPLIT_KEXTS_DEBUG
+    OSKextLog(/* kext */ NULL,
+              kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+              "copy prelink info data to kernelcache file %p to %p (%lu) <%s %d>",
+              (void *) kernelCacheData + plkInfo->plk_INFO.fileoff,
+              (void *) kernelCacheData + plkInfo->plk_INFO.fileoff + size,
+              size,
+              __func__, __LINE__);
+    
+    size = CFDataGetLength(plkInfo->kernelCacheImage);
+
+    OSKextLog(/* kext */ NULL,
+              kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+              "kernel cache start %p end %p (len %lu) <%s %d>",
+              (void *) kernelCacheData,
+              (void *) (kernelCacheData + size),
+              size,
+              __func__, __LINE__);
+    
+    u_char *    end_kernel_cache;
+    u_char *    end_copy;
+    end_copy = kernelCacheData + plkInfo->plk_INFO.fileoff + CFDataGetLength(prelinkInfoData);
+    end_kernel_cache = kernelCacheData + CFDataGetLength(plkInfo->kernelCacheImage);
+    if (end_copy > end_kernel_cache) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                  "overflow!!! prelink info end %p > kernelcache file end %p <%s %d>",
+                  end_copy, end_kernel_cache,
+                  __func__, __LINE__);
+        abort();
+    }
+#endif
+    
+    /* Set the info dictionary segment headers */
+    if (__OSKextSetSegmentAddress(plkInfo->kernelCacheImage,
+                                  kPrelinkInfoSegment,
+                                  plkInfo->plk_INFO.vmaddr) == false) {
+        goto finish;
+    }
+    if (__OSKextSetSegmentVMSize(plkInfo->kernelCacheImage,
+                                 kPrelinkInfoSegment,
+                                 plkInfo->plk_INFO.vmsize) == false) {
+        goto finish;
+    }
+    if (__OSKextSetSegmentOffset(plkInfo->kernelCacheImage,
+                                 kPrelinkInfoSegment,
+                                 plkInfo->plk_INFO.fileoff) == false) {
+        goto finish;
+    }
+    if (__OSKextSetSegmentFilesize(plkInfo->kernelCacheImage,
+                                   kPrelinkInfoSegment,
+                                   plkInfo->plk_INFO.vmsize) == false) {
+        goto finish;
+    }
+    
+    /* Set the info dictionary section headers */
+    if (__OSKextSetSectionAddress(plkInfo->kernelCacheImage,
+                                  kPrelinkInfoSegment,
+                                  kPrelinkInfoSection,
+                                  plkInfo->plk_INFO.vmaddr) == false) {
+        goto finish;
+    }
+    if (__OSKextSetSectionOffset(plkInfo->kernelCacheImage,
+                                 kPrelinkInfoSegment,
+                                 kPrelinkInfoSection,
+                                 plkInfo->plk_INFO.fileoff) == false) {
+        goto finish;
+    }
+    if (__OSKextSetSectionSize(plkInfo->kernelCacheImage,
+                               kPrelinkInfoSegment,
+                               kPrelinkInfoSection,
+                               plkInfo->plk_INFO.vmsize) == false) {
+        goto finish;
+    }
+    
+    success = true;
+finish:
+    if (success == false) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                  "%s %d - failed ",
+                  __func__, __LINE__);
+    }
+    return success;
+}
+ 
+/*********************************************************************
+ *********************************************************************/
 static u_long __OSKextCopyPrelinkInfoDictionary(
-    CFMutableDataRef prelinkImage,
-    CFDataRef        prelinkInfoData,
-    u_long           fileOffset,
-    uint64_t         sourceAddr)
+                                                CFMutableDataRef prelinkImage,
+                                                CFDataRef        prelinkInfoData,
+                                                u_long           fileOffset,
+                                                uint64_t         sourceAddr)
 {
     boolean_t    success    = false;
     u_char    * prelinkData = CFDataGetMutableBytePtr(prelinkImage);
     u_long      size        = 0;
-
+    
     size = CFDataGetLength(prelinkInfoData);
     memcpy(prelinkData + fileOffset, CFDataGetBytePtr(prelinkInfoData), size);
-
+    
     /* Set the info dictionary segment headers */
-
+    
     success = __OSKextSetSegmentAddress(prelinkImage, kPrelinkInfoSegment,
-        sourceAddr);
+                                        sourceAddr);
     if (!success) {
         goto finish;
     }
-
-    success = __OSKextSetSegmentVMSize(prelinkImage, kPrelinkInfoSegment, 
-        roundPageCrossSafe(size));
+    
+    success = __OSKextSetSegmentVMSize(prelinkImage, kPrelinkInfoSegment,
+                                       roundPageCrossSafe(size));
     if (!success) {
         goto finish;
     }
-
+    
     success = __OSKextSetSegmentOffset(prelinkImage, kPrelinkInfoSegment,
-        fileOffset);
+                                       fileOffset);
     if (!success) {
         goto finish;
     }
-
+    
     success = __OSKextSetSegmentFilesize(prelinkImage, kPrelinkInfoSegment,
-        size);
+                                         size);
     if (!success) {
         goto finish;
     }
-
+    
     /* Set the info dictionary section headers */
-
+    
     success = __OSKextSetSectionAddress(prelinkImage, kPrelinkInfoSegment,
-        kPrelinkInfoSection, sourceAddr);
+                                        kPrelinkInfoSection, sourceAddr);
     if (!success) {
         goto finish;
     }
-
+    
     success = __OSKextSetSectionOffset(prelinkImage, kPrelinkInfoSegment,
-        kPrelinkInfoSection, fileOffset);
+                                       kPrelinkInfoSection, fileOffset);
     if (!success) {
         goto finish;
     }
-
+    
     success = __OSKextSetSectionSize(prelinkImage, kPrelinkInfoSegment,
-        kPrelinkInfoSection, size);
+                                     kPrelinkInfoSection, size);
     if (!success) {
         goto finish;
     }
-
+    
 finish:
     return roundPageCrossSafe(size);
 }
-
 
 /*********************************************************************
 *********************************************************************/
@@ -15325,27 +19529,40 @@ CFDataRef OSKextCreatePrelinkedKernel(
     uint32_t            flags,
     CFDictionaryRef   * symbolsOut)
 {
-    CFDataRef                result             = NULL;
-    kern_return_t            kxldResult         = KERN_FAILURE;
-    boolean_t                success            = false;
-    boolean_t                swapped            = false;
-    KXLDContext            * kxldContext        = NULL;
-    KXLDFlags                kxldFlags          = kKxldFlagDefault;
-    CFArrayRef               loadList           = NULL;
-    CFDataRef                prelinkInfoData    = NULL;
-    CFMutableDataRef         prelinkImage       = NULL;
-    CFMutableDictionaryRef   symbols            = NULL;
-    u_long                   prelinkSize        = 0;
-    u_long                   size               = 0;
-    uint32_t                 baseFileOffset     = 0;
-    uint32_t                 fileOffset         = 0;
-    uint64_t                 textLoadAddr       = 0;
-    uint64_t                 textVMSize         = 0;
-    uint64_t                 baseLoadAddr       = 0;
-    uint64_t                 baseSourceAddr     = 0;
-    uint64_t                 sourceAddr         = 0;
-    uint64_t                 kxldPageSize       = 0;
-    
+    CFDataRef                  result             = NULL;
+    kern_return_t              kxldResult         = KERN_FAILURE;
+    boolean_t                  success            = false;
+    boolean_t                  swapped            = false;
+    boolean_t                  kextsFirst         = false;
+    KXLDContext              * kxldContext        = NULL;
+    KXLDFlags                  kxldFlags          = kKxldFlagDefault;
+    CFArrayRef                 loadList           = NULL;
+    CFDataRef                  prelinkInfoData    = NULL;
+    CFMutableDictionaryRef     symbols            = NULL;
+    u_long                     prelinkSize        = 0;
+    u_long                     size               = 0;
+    uint64_t                   kxldPageSize       = 0;
+    uint64_t                   lastKernelLoadAddr = 0;
+    uint64_t                   kextTextLoadAddr   = 0;
+    plkInfo                    plkInfo;
+    uint32_t                   fileOffset         = 0;
+    CFMutableDataRef           prelinkImage       = NULL;
+    uint32_t                   baseFileOffset     = 0;
+    uint64_t                   textLoadAddr       = 0;
+    uint64_t                   textVMSize         = 0;
+    uint64_t                   baseLoadAddr       = 0;
+    uint64_t                   baseSourceAddr     = 0;
+    uint64_t                   sourceAddr         = 0;
+    boolean_t                  isARM64            = false;
+    CFDataRef                  kernelUUID         = NULL;
+    const struct mach_header * mach_header        = NULL;
+    const void               * file_end;
+    macho_seek_result          seek_result;
+    struct _uuid_stuff         seek_uuid;
+    int uuid_order_swap = 0;
+
+    bzero((UInt8 *)&plkInfo, sizeof(plkInfo));
+
     /* Set up kxld's link context */
 
     /* <rdar://problem/10670709> and <rdar://problem/10778807>
@@ -15358,6 +19575,17 @@ CFDataRef OSKextCreatePrelinkedKernel(
         kxldFlags |= kKXLDFlagIncludeRelocs;
     }
 
+    /*
+     * If strict authentication is enabled, ensure that the skip authentication flag
+     * is not respected when building a prelinked kernel.
+     */
+    if (__sOSKextStrictAuthentication &&
+        (flags & kOSKextKernelcacheSkipAuthenticationFlag) != 0) {
+        OSKextLog(/* kext */ NULL, kOSKextLogWarningLevel | kOSKextLogLinkFlag,
+            "Ignoring skip authentication flag due to strict authentication mode.");
+        flags &= ~kOSKextKernelcacheSkipAuthenticationFlag;
+    }
+
     /* Handle cross-linking if necessary */
     kxldPageSize = __OSKextSetupCrossLinkByArch(OSKextGetArchitecture()->cputype);
 
@@ -15368,10 +19596,19 @@ CFDataRef OSKextCreatePrelinkedKernel(
         kxldPageSize = 0;
     }
 
+#if defined(CPU_TYPE_ARM64)
+    if (OSKextGetArchitecture()->cputype == CPU_TYPE_ARM64) {
+        isARM64 = true;
+    }
+#endif
+
     kxldResult = kxld_create_context(&kxldContext,
-        __OSKextLinkAddressCallback, __OSKextLoggingCallback, kxldFlags,
-        OSKextGetArchitecture()->cputype, OSKextGetArchitecture()->cpusubtype,
-        kxldPageSize);
+                                     isARM64 ? NULL : __OSKextLinkAddressCallback,
+                                     __OSKextLoggingCallback,
+                                     kxldFlags,
+                                     OSKextGetArchitecture()->cputype,
+                                     OSKextGetArchitecture()->cpusubtype,
+                                     kxldPageSize);
     if (kxldResult != KERN_SUCCESS) {
         OSKextLog(/* kext */ NULL, kOSKextLogErrorLevel | kOSKextLogLinkFlag,
              "Can't create link context.");
@@ -15381,6 +19618,17 @@ CFDataRef OSKextCreatePrelinkedKernel(
     /* Swap kernel if necessary */
     swapped = __OSKextSwapHeaders(kernelImage);
 
+    if (isARM64) {
+        kextsFirst = __OSKextWantKextsFirst(kernelImage);
+        success = __OSKextInit_plkInfo(kernelImage, kextArray, &plkInfo);
+        if (!success) {
+            OSKextLog(/* kext */ NULL, kOSKextLogErrorLevel,
+                      "Can't get kextcache segment info.");
+            goto finish;
+        }
+        goto doLinks;
+    }
+    
    /* Get the last last VM load address specified in the kernel image
     * (that is, the next "available" one).
     */
@@ -15393,12 +19641,15 @@ CFDataRef OSKextCreatePrelinkedKernel(
 
     baseFileOffset = roundPageCrossSafe(CFDataGetLength(kernelImage));
     baseSourceAddr = roundPageCrossSafeFixedWidth(baseSourceAddr);
+    if (kextsFirst) {
+        lastKernelLoadAddr = baseSourceAddr;
+    }
 
     /* For x86_64 systems, we prelink the kexts into a VM region that starts 2GB
      * from the top of the kernel __TEXT segment.
      */
-	if (OSKextGetArchitecture()->cputype == CPU_TYPE_X86_64) {
-        success = __OSKextGetSegmentAddressAndOffset(kernelImage,
+    if (OSKextGetArchitecture()->cputype == CPU_TYPE_X86_64) {
+        success = __OSKextGetSegmentAddressAndOffsetDataRef(kernelImage,
             SEG_TEXT, NULL, &textLoadAddr);
         if (!success) {
             OSKextLog(/* kext */ NULL,
@@ -15407,7 +19658,7 @@ CFDataRef OSKextCreatePrelinkedKernel(
             goto finish;
         }
 
-        success = __OSKextGetSegmentFileAndVMSize(kernelImage,
+        success = __OSKextGetSegmentFileAndVMSizeDataRef(kernelImage,
             SEG_TEXT, NULL, &textVMSize);
         if (!success) {
             OSKextLog(/* kext */ NULL,
@@ -15426,6 +19677,19 @@ CFDataRef OSKextCreatePrelinkedKernel(
 
         baseLoadAddr -= __kOSKextMaxKextDisplacement_x86_64;
     } else {
+        if (kextsFirst) {
+            success = __OSKextGetSegmentAddressAndOffsetDataRef(kernelImage,
+                                                         kPrelinkTextSegment,
+                                                         NULL,
+                                                         &kextTextLoadAddr);
+            if (!success) {
+                OSKextLog(/* kext */ NULL,
+                          kOSKextLogErrorLevel | kOSKextLogArchiveFlag,
+                          "Could not get kernel text address.");
+                goto finish;
+            }
+            baseSourceAddr = roundPageCrossSafeFixedWidth(kextTextLoadAddr);
+        }
         baseLoadAddr = baseSourceAddr;
     }
 
@@ -15433,79 +19697,179 @@ CFDataRef OSKextCreatePrelinkedKernel(
     sourceAddr = baseSourceAddr;
 
     /* Perform kext links */
+doLinks:
+    if (isARM64) {
+        loadList = __OSKextPrelinkSplitKexts(kextArray,
+                                             &plkInfo,
+                                             kxldContext,
+                                             (flags & kOSKextKernelcacheNeedAllFlag),
+                                             (flags & kOSKextKernelcacheSkipAuthenticationFlag),
+                                             (flags & kOSKextKernelcachePrintDiagnosticsFlag),
+                                             (flags & kOSKextKernelcacheStripSymbolsFlag));
+    }
+    else {
+        loadList = __OSKextPrelinkKexts(kextArray,
+                                        kernelImage,
+                                        baseLoadAddr, // where we load kext __TEXT segments
+                                        sourceAddr,
+                                        kxldContext,
+                                        &size,
+                                        (flags & kOSKextKernelcacheNeedAllFlag),
+                                        (flags & kOSKextKernelcacheSkipAuthenticationFlag),
+                                        (flags & kOSKextKernelcachePrintDiagnosticsFlag),
+                                        (flags & kOSKextKernelcacheStripSymbolsFlag));
+    }
 
-    loadList = __OSKextPrelinkKexts(kextArray, kernelImage, 
-        baseLoadAddr, sourceAddr, kxldContext, &size,
-        (flags & kOSKextKernelcacheNeedAllFlag),
-        (flags & kOSKextKernelcacheSkipAuthenticationFlag),
-        (flags & kOSKextKernelcachePrintDiagnosticsFlag),
-        (flags & kOSKextKernelcacheStripSymbolsFlag));
     if (!loadList) {
         goto finish;
     }
 
-    prelinkSize += size;
-    sourceAddr += size;
+    if (isARM64 == false) {
+        prelinkSize += size;
+        sourceAddr += size;
+    }
+
+    /* Grab the kernel UUID */
+    if (isARM64) {
+        mach_header = (const struct mach_header *)CFDataGetBytePtr(plkInfo.kernelImage);
+        file_end = (((const char *)mach_header) + CFDataGetLength(plkInfo.kernelImage));
+    } else {
+        mach_header = (const struct mach_header *)CFDataGetBytePtr(kernelImage);
+        file_end = (((const char *)mach_header) + CFDataGetLength(kernelImage));
+    }
+    if (ISSWAPPEDMACHO(MAGIC32(mach_header))) {
+        uuid_order_swap = 1;
+    }
+
+    seek_result = macho_scan_load_commands(mach_header, file_end, __OSKextUUIDCallback, (const void **)&seek_uuid);
+    if (seek_result == macho_seek_result_found) {
+        kernelUUID = CFDataCreate(kCFAllocatorDefault, (u_char *)seek_uuid.uuid,
+                                  CondSwapInt32(uuid_order_swap, seek_uuid.uuid_size));
+    } else {
+        kcgen_verboseLog("Unable to find kernel UUID from kernel image, macho_scan_load_commands returned %d", macho_seek_result_found);
+    }
 
     /* Create the serialized info dictionary */
 
-    prelinkInfoData = __OSKextCreatePrelinkInfoDictionary(loadList,
-        volumeRootURL, (flags & kOSKextKernelcacheIncludeAllPersonalitiesFlag));
+    prelinkInfoData = __OSKextCreatePrelinkInfoDictionary(&plkInfo,
+                                                          loadList,
+                                                          volumeRootURL,
+                                                          (flags & kOSKextKernelcacheIncludeAllPersonalitiesFlag),
+                                                          isARM64,
+                                                          kernelUUID);
     if (!prelinkInfoData) {
         goto finish;
     }
 
     size = roundPageCrossSafe(CFDataGetLength(prelinkInfoData));
-    prelinkSize += size;
 
-   /* Allocate a buffer to contain the prelinked kernel.
-    * It may end up smaller than prelinkSize when we copy
-    * the base kernel image, but it won't end up bigger!
-    */
-    prelinkImage = CFDataCreateMutable(kCFAllocatorDefault, prelinkSize);
-    if (!prelinkImage) {
-        OSKextLogMemError();
-        goto finish;
+    if (isARM64) {
+        CFIndex kcSize = CFDataGetLength(plkInfo.kernelCacheImage);
+
+        kcgen_verboseLog("grow plkInfo.kernelCacheImage by size %ld to %ld",
+                         size, kcSize + size);
+
+        // save size of __PRELINK_INFO data
+        plkInfo.plk_INFO.vmsize = size;
+
+        CFMutableDataRef expandedImage = NULL;
+        
+        expandedImage = CFDataCreateMutableCopy(kCFAllocatorDefault,
+                                                kcSize + size,
+                                                plkInfo.kernelCacheImage);
+        if (expandedImage == NULL) {
+            OSKextLog(/* kext */ NULL,
+                      kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                      "%s %d - expandedImage failed",
+                      __func__, __LINE__);
+            goto finish;
+        }
+        CFRelease(plkInfo.kernelCacheImage);
+        plkInfo.kernelCacheImage = expandedImage;
+        CFDataSetLength(plkInfo.kernelCacheImage, kcSize + size);
+
+#if SPLIT_KEXTS_DEBUG
+        __OSKextShowPLKInfo(&plkInfo);
+#endif
+
+        // copy in kernel, this also sets up the macho header (not updated yet)
+        if (swapped) {
+            __OSKextUnswapHeaders(kernelImage);
+            swapped = false;
+        }
+        CFDataReplaceBytes(plkInfo.kernelCacheImage,
+                           CFRangeMake(0, CFDataGetLength(kernelImage)),
+                           CFDataGetBytePtr(kernelImage),
+                           CFDataGetLength(kernelImage));
+        
+        /* Copy in all kext info dictionaries */
+        if (__OSKextCopySplitPrelinkInfoDictionary(&plkInfo, prelinkInfoData) == false) {
+            goto finish;
+        }
+        
+        /* set the sizes of the prelink segments in the KC macho */
+        if (__OSKextSetPLKSegInfo(&plkInfo) == false) {
+            goto finish;
+        }
     }
-
-    CFDataSetLength(prelinkImage, prelinkSize);
-
-    /* Copy the base kernel */
-
-    if (swapped) {
-        __OSKextUnswapHeaders(kernelImage);
-        swapped = false;
+    else {
+        prelinkSize += size;
+        
+        /* Allocate a buffer to contain the prelinked kernel.
+         * It may end up smaller than prelinkSize when we copy
+         * the base kernel image, but it won't end up bigger!
+         */
+        prelinkImage = CFDataCreateMutable(kCFAllocatorDefault, prelinkSize);
+        if (!prelinkImage) {
+            OSKextLogMemError();
+            goto finish;
+        }
+        
+        CFDataSetLength(prelinkImage, prelinkSize);
+        
+        /* Copy the base kernel */
+        
+        if (swapped) {
+            __OSKextUnswapHeaders(kernelImage);
+            swapped = false;
+        }
+        
+        CFDataReplaceBytes(prelinkImage, CFRangeMake(0, CFDataGetLength(kernelImage)),
+                           CFDataGetBytePtr(kernelImage), CFDataGetLength(kernelImage));
+        
+        /* Reset the fileOffset and sourceAddr */
+        
+        fileOffset = baseFileOffset;
+        sourceAddr = baseSourceAddr;
+        
+        /* Copy the kexts */
+        size = __OSKextCopyPrelinkedKexts(prelinkImage,
+                                          loadList,
+                                          fileOffset,
+                                          sourceAddr);
+        
+        fileOffset += size;
+        if (kextsFirst) {
+            sourceAddr = lastKernelLoadAddr;
+        }
+        else {
+            sourceAddr += size;
+        }
+        
+        /* Copy the info dictionary */
+        
+        size = __OSKextCopyPrelinkInfoDictionary(prelinkImage, prelinkInfoData,
+                                                 fileOffset, sourceAddr);
+        fileOffset += size;
+        sourceAddr += size;
+        
+        /* Trim the new image to the size actually copied.
+         */
+        CFDataSetLength(prelinkImage, fileOffset);
     }
-
-    CFDataReplaceBytes(prelinkImage, CFRangeMake(0, CFDataGetLength(kernelImage)),
-        CFDataGetBytePtr(kernelImage), CFDataGetLength(kernelImage));
-
-    /* Reset the fileOffset and sourceAddr */
-
-    fileOffset = baseFileOffset;
-    sourceAddr = baseSourceAddr;
-
-    /* Copy the kexts */
-
-    size = __OSKextCopyPrelinkedKexts(prelinkImage, loadList, 
-        fileOffset, sourceAddr);
-
-    fileOffset += size;
-    sourceAddr += size;
-
-    /* Copy the info dictionary */
-
-    size = __OSKextCopyPrelinkInfoDictionary(prelinkImage, prelinkInfoData,
-        fileOffset, sourceAddr);
-    fileOffset += size;
-    sourceAddr += size;
-
-   /* Trim the new image to the size actually copied.
-    */
-    CFDataSetLength(prelinkImage, fileOffset);
 
     /* Save the kexts' symbols if requested */
-    
+
     if (symbolsOut) {
         int i = 0;
 
@@ -15532,17 +19896,64 @@ CFDataRef OSKextCreatePrelinkedKernel(
         *symbolsOut = CFRetain(symbols);
     }
 
-    result = CFRetain(prelinkImage);
+    if (isARM64) {
+        result = CFRetain(plkInfo.kernelCacheImage);
+    }
+    else {
+        result = CFRetain(prelinkImage);
+    }
 
 finish:
     if (swapped) __OSKextUnswapHeaders(kernelImage);
 
     SAFE_RELEASE(loadList);
     SAFE_RELEASE(prelinkInfoData);
-    SAFE_RELEASE(prelinkImage);
+    if (isARM64) {
+        SAFE_RELEASE(plkInfo.kernelCacheImage);
+    }
+    else {
+        SAFE_RELEASE(prelinkImage);
+    }
+    SAFE_RELEASE(kernelUUID);
+
     SAFE_RELEASE(symbols);
     if (kxldContext) kxld_destroy_context(kxldContext);
 
+    return result;
+}
+
+/*********************************************************************
+ * <rdar://problem/23548067>, <rdar://problem/23804415>
+ * Check to see if we want prelinked kexts (__PRELINK_TEXT) located at 
+ * lower vmaddr than kernel.
+ *********************************************************************/
+static boolean_t __OSKextWantKextsFirst(CFDataRef kernelImage)
+{
+    boolean_t                   result = false;
+    const UInt8 *               kernelImagePtr = CFDataGetBytePtr(kernelImage);
+    uint64_t                    i;
+    struct mach_header_64 *     kernel_header;
+    struct segment_command_64 * seg_cmd = NULL;
+    
+    // we only support arm64 at this point
+    if (ISMACHO64(MAGIC32(kernelImagePtr))) {
+        kernel_header = (struct mach_header_64 *)kernelImagePtr;
+        seg_cmd = (struct segment_command_64 *) ((uintptr_t)kernel_header + sizeof(*kernel_header));
+        
+        /* Make sure this kernel supports the new layout.  We do this by looking
+         * for the __PRELINK_DATA segment which is only present in kernels that
+         * want all the kext segments before the kernel.
+         */
+        for (i = 0; i < kernel_header->ncmds; i++){
+            if (seg_cmd->cmd == LC_SEGMENT_64 &&
+                strncmp(seg_cmd->segname, kPrelinkDataSegment, sizeof(seg_cmd->segname)) == 0) {
+                result = true;
+                break;
+            }
+            seg_cmd = (struct segment_command_64 *) ((uintptr_t)seg_cmd + seg_cmd->cmdsize);
+        }
+    }
+    
     return result;
 }
 
@@ -15648,7 +20059,7 @@ CFStringRef __OSKextCopyExecutableRelativePath(OSKextRef aKext)
     CFStringRef  result            = NULL;
     CFURLRef     kextAbsURL        = NULL;  // must release
     CFStringRef  kextAbsPath       = NULL;  // must release
-    CFURLRef     executableURL     = NULL;  // must release
+    CFURLRef     executableURL     = NULL;  // do not release
     CFURLRef     executableAbsURL  = NULL;  // must release
     CFStringRef  executableAbsPath = NULL;  // must release
     CFStringRef  executableRelPath = NULL;  // must release
@@ -15662,7 +20073,7 @@ CFStringRef __OSKextCopyExecutableRelativePath(OSKextRef aKext)
         goto finish;
     }
 
-    executableURL = _CFBundleCopyExecutableURLInDirectory(OSKextGetURL(aKext));
+    executableURL = OSKextGetExecutableURL(aKext);
     if (!executableURL) {
         goto finish;
     }
@@ -15686,13 +20097,31 @@ finish:
 
     SAFE_RELEASE(kextAbsURL);
     SAFE_RELEASE(kextAbsPath);
-    SAFE_RELEASE(executableURL);
     SAFE_RELEASE(executableAbsURL);
     SAFE_RELEASE(executableAbsPath);
     SAFE_RELEASE(executableRelPath);
 
     return result;
 }
+
+/*********************************************************************
+*********************************************************************/
+CFStringRef OSKextCopyExecutableName(OSKextRef aKext)
+{
+    CFStringRef  result            = NULL;
+    CFURLRef     executableURL     = NULL;  // do not release
+
+    executableURL = OSKextGetKernelExecutableURL(aKext);
+    if (!executableURL) {
+        goto finish;
+    }
+    result = CFURLCopyLastPathComponent(executableURL);
+
+finish:
+
+    return result;
+}
+
 
 #if PRAGMA_MARK
 /********************************************************************/
@@ -16025,3 +20454,373 @@ Boolean _isString(CFTypeRef cf)
     return false;
 }
 
+__unused static void __OSKextShowPLKInfo(plkInfo *info)
+{
+    OSKextLog(NULL, kOSKextLogErrorLevel | kOSKextLogArchiveFlag,
+              "\n plkInfo @%p: <%s %d>", info,
+              __func__, __LINE__);
+
+    if (info->kaslrOffsets) {
+        OSKextLog(NULL, kOSKextLogErrorLevel | kOSKextLogArchiveFlag,
+                  "kaslrOffsets count %ld",
+                  CFSetGetCount(info->kaslrOffsets));
+    }
+
+    OSKextLog(NULL, kOSKextLogErrorLevel | kOSKextLogArchiveFlag,
+              "kernelImage %p (%ld) kernelCacheImage %p (%ld)",
+              CFDataGetBytePtr(info->kernelImage),
+              CFDataGetLength(info->kernelImage),
+              CFDataGetBytePtr(info->kernelCacheImage),
+              CFDataGetLength(info->kernelCacheImage));
+    OSKextLog(NULL, kOSKextLogErrorLevel | kOSKextLogArchiveFlag,
+              "kernel_TEXT: vmaddr %p vmsize %llu fileoff %llu filesize %llu)",
+              (void *)info->kernel_TEXT.vmaddr,
+              info->kernel_TEXT.vmsize,
+              info->kernel_TEXT.fileoff,
+              info->kernel_TEXT.vmsize);
+
+    for (enum enumSegIdx segIdx = SEG_IDX_TEXT; segIdx < SEG_IDX_COUNT; segIdx++) {
+        uint64_t vmbase = getKCPlkSegVMAddr(info, segIdx);
+        uint64_t filebase = getKCPlkSegFileOff(info, segIdx);
+        uint64_t vmoff = getKCPlkSegNextVMAddr(info, segIdx) - vmbase;
+        uint64_t fileoff = filebase + vmoff;
+        uint64_t vmsize = getKCPlkSegVMSize(info, segIdx);
+
+        OSKextLog(NULL, "plk_%s: vmaddr %p vmsize %llu fileoff %llu next_fileoff %llu filesize %llu",
+                  segIdxToName(segIdx), vmbase, vmsize, filebase, fileoff, vmsize );
+    }
+
+    OSKextLog(NULL, kOSKextLogErrorLevel | kOSKextLogArchiveFlag,
+              "plk_INFO: vmaddr %p vmsize %llu fileoff %llu filesize %llu)",
+              (void *)info->plk_INFO.vmaddr,
+              info->plk_INFO.vmsize,
+              info->plk_INFO.fileoff,
+              info->plk_INFO.vmsize);
+}
+
+#if SPLIT_KEXTS_DEBUG
+
+#if 0
+static void __OSKextShowMachoHeaderCFData(CFDataRef  kextImage)
+{
+    const UInt8 *   imagePtr = CFDataGetBytePtr(kextImage);
+    CFIndex         imageSize = CFDataGetLength(kextImage);
+    
+    __OSKextShowMachoHeader(imagePtr, imageSize);
+}
+#endif
+
+static void __OSKextShowMachoHeader(const UInt8 * imagePtr, CFIndex imageSize)
+{
+    uint64_t        i;
+
+    if (imagePtr == NULL || imageSize < 1)  return;
+    
+    OSKextLog(/* kext */ NULL,
+              kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+              "\n macho header at %p size %ld ",
+              (void *) imagePtr, imageSize);
+    if (imageSize > 8) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                  "0x%02X %02X %02X %02X %02X %02X %02X %02X  ",
+                  *(imagePtr +0),
+                  *(imagePtr +1),
+                  *(imagePtr +2),
+                  *(imagePtr +3),
+                  *(imagePtr +4),
+                  *(imagePtr +5),
+                  *(imagePtr +6),
+                  *(imagePtr +7) );
+    }
+
+    if (ISMACHO64(MAGIC32(imagePtr))) {
+        struct mach_header_64 *     kext_header;
+        struct segment_command_64 * seg_cmd;
+        uint64_t le_fileoff = 0;
+        uint64_t le_filesize = 0;
+        
+        kext_header = (struct mach_header_64 *)imagePtr;
+        seg_cmd = NULL;
+        seg_cmd = (struct segment_command_64 *) ((uintptr_t)kext_header + sizeof(*kext_header));
+        
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                  "NCMDS=%d",
+                  kext_header->ncmds);
+        
+        for (i = 0; i < kext_header->ncmds; i++) {
+            if (seg_cmd->cmd == LC_SEGMENT_64) {
+                OSKextLog(/* kext */ NULL,
+                          kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                          "cmd 0x%02X '%s' segment '%s' vmaddr %p vmsize %llu fileoff %llu filesize %llu nsects %u seg data at %p ",
+                          seg_cmd->cmd,
+                          getSegmentCommandName(seg_cmd->cmd),
+                          seg_cmd->segname[0] ? seg_cmd->segname : "none",
+                          (void *)seg_cmd->vmaddr,
+                          seg_cmd->vmsize,
+                          seg_cmd->fileoff,
+                          seg_cmd->filesize,
+                          seg_cmd->nsects,
+                          (void *) (imagePtr + seg_cmd->fileoff) );
+                
+                if (seg_cmd->fileoff + seg_cmd->filesize > (uint64_t)imageSize) {
+                    OSKextLog(/* kext */ NULL,
+                              kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                              "\n\n BAD MACHO! - segment fileoff %llu + filesize %llu > image size %lu \n\n",
+                              seg_cmd->fileoff,
+                              seg_cmd->filesize,
+                              imageSize);
+                }
+                if (!strncmp(seg_cmd->segname, SEG_LINKEDIT, sizeof(seg_cmd->segname))) {
+                    // save __LINKEDIT segment info for later
+                    le_fileoff = seg_cmd->fileoff;;
+                    le_filesize = seg_cmd->filesize;;
+                }
+
+                struct section_64 *sect = NULL;
+                u_int j = 0;
+                sect = (struct section_64 *) (&seg_cmd[1]);
+                for (j = 0; j < seg_cmd->nsects; ++j, ++sect) {
+                    OSKextLog(/* kext */ NULL,
+                              kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                              "sectname '%s' addr %p size %llu offset %u reloff %u nreloc %u ",
+                              sect->sectname[0] ? sect->sectname : "none",
+                              (void *)sect->addr,
+                              sect->size,
+                              sect->offset,
+                              sect->reloff,
+                              sect->nreloc);
+ 
+                    if (sect->offset + sect->size > (uint64_t)imageSize) {
+                        OSKextLog(/* kext */ NULL,
+                                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                                  "\n\n BAD MACHO! - section offset %u + size %llu > image size %lu \n\n",
+                                  sect->offset,
+                                  sect->size,
+                                  imageSize);
+                    }
+                }
+             
+//                if (!strncmp(seg_cmd->segname, SEG_LINKEDIT, sizeof(seg_cmd->segname))) {
+//                    __OSKextScanFor(imagePtr + seg_cmd->fileoff, seg_cmd->filesize, 0x7F);
+//                }
+            }
+            else if (seg_cmd->cmd == LC_SYMTAB) {
+                struct symtab_command * symtab_cmd = (struct symtab_command *) seg_cmd;
+                uint32_t syms_end;
+                
+                OSKextLog(/* kext */ NULL,
+                          kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                          "cmd 0x%02X '%s' cmdsize %u symoff %u nsyms %u stroff %u strsize %u ",
+                          symtab_cmd->cmd,
+                          getSegmentCommandName(symtab_cmd->cmd),
+                          symtab_cmd->cmdsize,
+                          symtab_cmd->symoff,
+                          symtab_cmd->nsyms,
+                          symtab_cmd->stroff,
+                          symtab_cmd->strsize);
+                
+                //#include <mach-o/nlist.h>
+                syms_end = symtab_cmd->symoff + (symtab_cmd->nsyms * sizeof(struct nlist_64));
+                if (symtab_cmd->symoff < le_fileoff || syms_end > le_fileoff + le_filesize) {
+                    OSKextLog(/* kext */ NULL,
+                              kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                              "\n\n BAD MACHO! - LC_SYMTAB symoff %u to %u not in __LINKEDIT segment bounds %llu to %llu \n\n",
+                              symtab_cmd->symoff,
+                              syms_end,
+                              le_fileoff,
+                              le_fileoff + le_filesize);
+                }
+        
+                syms_end = symtab_cmd->stroff + symtab_cmd->strsize;
+                if (symtab_cmd->stroff < le_fileoff ||
+                    (syms_end > le_fileoff + le_filesize)) {
+                    OSKextLog(/* kext */ NULL,
+                              kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                              "\n\n BAD MACHO! - LC_SYMTAB stroff %u to %u not in __LINKEDIT segment bounds %llu to %llu \n\n",
+                              symtab_cmd->stroff,
+                              syms_end,
+                              le_fileoff,
+                              le_fileoff + le_filesize);
+                }
+            }
+            else if (seg_cmd->cmd == LC_DYSYMTAB) {
+                struct dysymtab_command * dsymtab_cmd = (struct dysymtab_command *) seg_cmd;
+
+                OSKextLog(/* kext */ NULL,
+                          kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                          "cmd 0x%02X '%s' cmdsize %u ilocalsym %u nlocalsym %u iextdefsym %u nextdefsym %u ",
+                          dsymtab_cmd->cmd,
+                          getSegmentCommandName(dsymtab_cmd->cmd),
+                          dsymtab_cmd->cmdsize,
+                          dsymtab_cmd->ilocalsym,
+                          dsymtab_cmd->nlocalsym,
+                          dsymtab_cmd->iextdefsym,
+                          dsymtab_cmd->nextdefsym);
+                OSKextLog(/* kext */ NULL,
+                          kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                          "cmd 0x%02X '%s' iundefsym %u nundefsym %u tocoff %u ntoc %u modtaboff %u nmodtab %u ",
+                          dsymtab_cmd->cmd,
+                          getSegmentCommandName(dsymtab_cmd->cmd),
+                          dsymtab_cmd->iundefsym,
+                          dsymtab_cmd->nundefsym,
+                          dsymtab_cmd->tocoff,
+                          dsymtab_cmd->ntoc,
+                          dsymtab_cmd->modtaboff,
+                          dsymtab_cmd->nmodtab);
+                OSKextLog(/* kext */ NULL,
+                          kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                          "cmd 0x%02X '%s' extrefsymoff %u nextrefsyms %u indirectsymoff %u nindirectsyms %u ",
+                          dsymtab_cmd->cmd,
+                          getSegmentCommandName(dsymtab_cmd->cmd),
+                          dsymtab_cmd->extrefsymoff,
+                          dsymtab_cmd->nextrefsyms,
+                          dsymtab_cmd->indirectsymoff,
+                          dsymtab_cmd->nindirectsyms);
+                OSKextLog(/* kext */ NULL,
+                          kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                          "cmd 0x%02X '%s' extreloff %u nextrel %u locreloff %u nlocrel %u ",
+                          dsymtab_cmd->cmd,
+                          getSegmentCommandName(dsymtab_cmd->cmd),
+                          dsymtab_cmd->extreloff,
+                          dsymtab_cmd->nextrel,
+                          dsymtab_cmd->locreloff,
+                          dsymtab_cmd->nlocrel);
+                                                     
+                 if (dsymtab_cmd->locreloff < le_fileoff || dsymtab_cmd->locreloff > le_fileoff + le_filesize) {
+                     OSKextLog(/* kext */ NULL,
+                               kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                               "\n\n BAD MACHO! - LC_DYSYMTAB locreloff %u not in __LINKEDIT segment bounds %llu to %llu \n\n",
+                               dsymtab_cmd->locreloff,
+                               le_fileoff,
+                               le_fileoff + le_filesize);
+                 }
+            }
+            else if (seg_cmd->cmd == LC_SEGMENT_SPLIT_INFO) {
+                struct linkedit_data_command * lc = (struct linkedit_data_command *) seg_cmd;
+                OSKextLog(/* kext */ NULL,
+                          kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                          "cmd 0x%02X '%s' cmdsize %u dataoff %u datasize %u split seg info data (within LINKEDIT) at %p",
+                          seg_cmd->cmd,
+                          getSegmentCommandName(seg_cmd->cmd),
+                          lc->cmdsize,
+                          lc->dataoff,
+                          lc->datasize,
+                          (void *) (imagePtr + lc->dataoff) );
+              
+                if (lc->dataoff < le_fileoff || lc->dataoff + lc->datasize > le_fileoff + le_filesize) {
+                    OSKextLog(/* kext */ NULL,
+                              kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                              "\n\n BAD MACHO! - LC_SEGMENT_SPLIT_INFO dataoff %u to %u not in __LINKEDIT segment bounds %llu to %llu \n\n",
+                              lc->dataoff,
+                              lc->dataoff + lc->datasize,
+                              le_fileoff,
+                              le_fileoff + le_filesize);
+                }
+
+//                OSKextLog(NULL,
+//                          kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+//                          "LC_SEGMENT_SPLIT_INFO %p 0x%02X %02X %02X %02X %02X %02X %02X %02X  ",
+//                          (void *) (imagePtr + lc->dataoff +0),
+//                          *(imagePtr + lc->dataoff +0),
+//                          *(imagePtr + lc->dataoff +1),
+//                          *(imagePtr + lc->dataoff +2),
+//                          *(imagePtr + lc->dataoff +3),
+//                          *(imagePtr + lc->dataoff +4),
+//                          *(imagePtr + lc->dataoff +5),
+//                          *(imagePtr + lc->dataoff +6),
+//                          *(imagePtr + lc->dataoff +7) );
+            }
+            else {
+                OSKextLog(/* kext */ NULL,
+                          kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                          "cmd 0x%02X '%s' ",
+                          seg_cmd->cmd,
+                          getSegmentCommandName(seg_cmd->cmd));
+            }
+            seg_cmd = (struct segment_command_64 *) ((uintptr_t)seg_cmd + seg_cmd->cmdsize);
+        } // for loop
+    } else {
+        struct mach_header *        kext_header;
+        struct segment_command *    seg_cmd;
+        
+        kext_header = (struct mach_header *)imagePtr;
+        seg_cmd = NULL;
+        seg_cmd = (struct segment_command *) ((uintptr_t)kext_header + sizeof(*kext_header));
+        
+        for (i = 0; i < kext_header->ncmds; i++){
+            if (seg_cmd->cmd == LC_SEGMENT) {
+                // - print segment info;
+            }
+            seg_cmd = (struct segment_command *) ((uintptr_t)seg_cmd + seg_cmd->cmdsize);
+        } // for loop
+    }
+    return;
+}
+
+#if 0
+static void __OSKextScanFor(const UInt8 *dataPtr, int count, const UInt8 theChar)
+{
+    int i;
+    int hits = 0;
+    
+    for (i = 0; i < count; i++) {
+        if (*(dataPtr + i) == theChar) {
+            OSKextLog(NULL,
+                      kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                      "matched at %d %p", i, (void *) (dataPtr + i));
+            OSKextLog(/* kext */ NULL,
+                      kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                      "LC_SEGMENT_SPLIT_INFO: 0x%02X %02X %02X %02X %02X %02X %02X %02X  ",
+                      *(dataPtr + i +0),
+                      *(dataPtr + i +1),
+                      *(dataPtr + i +2),
+                      *(dataPtr + i +3),
+                      *(dataPtr + i +4),
+                      *(dataPtr + i +5),
+                      *(dataPtr + i +6),
+                      *(dataPtr + i +7) );
+
+            hits++;
+        }
+    }
+    OSKextLog(NULL,
+              kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+              "%d hits starting at %p", hits, (void *) dataPtr);
+}
+#endif
+
+
+#endif
+
+__unused static const char * getSegmentCommandName(uint32_t theSegCommand)
+{
+    const char * theResult;
+    
+    switch(theSegCommand) {
+        case LC_SYMTAB:
+            theResult = "LC_SYMTAB";
+            break;
+        case LC_DYSYMTAB:
+            theResult = "LC_DYSYMTAB";
+            break;
+        case LC_SEGMENT_64:
+            theResult = "LC_SEGMENT_64";
+            break;
+        case LC_UUID:
+            theResult = "LC_UUID";
+            break;
+        case LC_SOURCE_VERSION:
+            theResult = "LC_SOURCE_VERSION";
+            break;
+        case LC_SEGMENT_SPLIT_INFO:
+            theResult = "LC_SEGMENT_SPLIT_INFO";
+            break;
+        default:
+            theResult = "Unknown Load Command";
+            break;
+    }
+    return(theResult);
+}
+   

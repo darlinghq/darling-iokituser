@@ -67,50 +67,43 @@ IOHIDPostEvent( io_connect_t        connect,
                 IOOptionBits        options );
 
 extern kern_return_t
-IOHIDSetMouseLocation( io_connect_t connect,
-	int x, int y);
+IOHIDSetMouseLocation( io_connect_t connect, int x, int y);
 
 extern kern_return_t
 IOHIDGetButtonEventNum( io_connect_t connect,
-	NXMouseButton button, int * eventNum );
+	NXMouseButton button, int * eventNum ) __deprecated;
 
 extern kern_return_t
-IOHIDSetCursorBounds( io_connect_t connect, const IOGBounds * bounds );
+IOHIDGetScrollAcceleration( io_connect_t handle, double * acceleration ) __OSX_AVAILABLE_BUT_DEPRECATED(__MAC_10_0, __MAC_10_12, __IPHONE_NA, __IPHONE_NA);
 
 extern kern_return_t
-IOHIDSetOnScreenCursorBounds( io_connect_t connect, const IOGPoint * point, const IOGBounds * bounds );
+IOHIDSetScrollAcceleration( io_connect_t handle, double acceleration ) __OSX_AVAILABLE_BUT_DEPRECATED(__MAC_10_0, __MAC_10_12, __IPHONE_NA, __IPHONE_NA);
 
 extern kern_return_t
-IOHIDGetScrollAcceleration( io_connect_t handle, double * acceleration );
+IOHIDGetMouseAcceleration( io_connect_t handle, double * acceleration ) __OSX_AVAILABLE_BUT_DEPRECATED(__MAC_10_0, __MAC_10_12, __IPHONE_NA, __IPHONE_NA);
 
 extern kern_return_t
-IOHIDSetScrollAcceleration( io_connect_t handle, double acceleration );
-
-extern kern_return_t
-IOHIDGetMouseAcceleration( io_connect_t handle, double * acceleration );
-
-extern kern_return_t
-IOHIDSetMouseAcceleration( io_connect_t handle, double acceleration );
+IOHIDSetMouseAcceleration( io_connect_t handle, double acceleration ) __OSX_AVAILABLE_BUT_DEPRECATED(__MAC_10_0, __MAC_10_12, __IPHONE_NA, __IPHONE_NA);
 
 extern kern_return_t
 IOHIDGetMouseButtonMode( io_connect_t handle, int * mode );
 
 extern kern_return_t
-IOHIDSetMouseButtonMode( io_connect_t handle, int mode );
+IOHIDSetMouseButtonMode( io_connect_t handle, int mode ) __OSX_AVAILABLE_BUT_DEPRECATED(__MAC_10_0, __MAC_10_12, __IPHONE_NA, __IPHONE_NA);
 
 extern kern_return_t
-IOHIDGetAccelerationWithKey( io_connect_t handle, CFStringRef key, double * acceleration );
+IOHIDGetAccelerationWithKey( io_connect_t handle, CFStringRef key, double * acceleration ) __OSX_AVAILABLE_BUT_DEPRECATED(__MAC_10_0, __MAC_10_12, __IPHONE_NA, __IPHONE_NA);
 
 extern kern_return_t
-IOHIDSetAccelerationWithKey( io_connect_t handle, CFStringRef key, double acceleration );
+IOHIDSetAccelerationWithKey( io_connect_t handle, CFStringRef key, double acceleration ) __OSX_AVAILABLE_BUT_DEPRECATED(__MAC_10_0, __MAC_10_12, __IPHONE_NA, __IPHONE_NA);
 
 extern kern_return_t
 IOHIDGetParameter( io_connect_t handle, CFStringRef key, IOByteCount maxSize, 
-		void * bytes, IOByteCount * actualSize );
+		void * bytes, IOByteCount * actualSize ) __OSX_AVAILABLE_BUT_DEPRECATED(__MAC_10_0, __MAC_10_12, __IPHONE_2_0, __IPHONE_10_0);
 
 extern kern_return_t
 IOHIDSetParameter( io_connect_t handle, CFStringRef key, 
-		const void * bytes, IOByteCount size );
+		const void * bytes, IOByteCount size ) __OSX_AVAILABLE_BUT_DEPRECATED(__MAC_10_0, __MAC_10_12, __IPHONE_NA, __IPHONE_NA);
 
 extern kern_return_t
 IOHIDCopyCFTypeParameter( io_connect_t handle, CFStringRef key,
@@ -145,6 +138,79 @@ IOHIDSetVirtualDisplayBounds( io_connect_t handle, UInt32 display_token, const I
 
 extern kern_return_t
 IOHIDGetActivityState( io_connect_t handle, bool *hidActivityIdle );
+
+/*
+ * @typedef IOHIDRequestType
+ *
+ * @abstract
+ * Request type passed in to IOHIDCheckAccess/IOHIDRequestAccess.
+ *
+ * @field kIOHIDRequestTypePostEvent
+ * Request to post event through IOHIDPostEvent API. Access must be granted
+ * by the user to use this API. If you do not request access through the
+ * IOHIDRequestAccess call, the request will be made on the process's behalf
+ * in the IOHIDPostEvent call.
+ *
+ * @field kIOHIDRequestTypeListenEvent
+ * Request to listen to event through IOHIDManager/IOHIDDevice API. Access must
+ * be granted by the user to use this API. If you do not request access through
+ * the IOHIDRequestAccess call, the request will be made on the process's behalf
+ * in IOHIDManagerOpen/IOHIDDeviceOpen calls.
+ *
+ */
+typedef enum {
+    kIOHIDRequestTypePostEvent,
+    kIOHIDRequestTypeListenEvent
+} IOHIDRequestType;
+
+/*
+ * @typedef IOHIDAccessType
+ *
+ * @abstract
+ * Enumerator of access types returned from IOHIDCheckAccess.
+ */
+typedef enum {
+    kIOHIDAccessTypeGranted,
+    kIOHIDAccessTypeDenied,
+    kIOHIDAccessTypeUnknown
+} IOHIDAccessType;
+
+/*!
+ * @function IOHIDCheckAccess
+ *
+ * @abstract
+ * Checks if the process has access to a specific IOHIDRequestType. A process
+ * may request access by calling the IOHIDRequestAccess function.
+ *
+ * @param requestType
+ * The request type defined in the IOHIDRequestType enumerator.
+ *
+ * @result
+ * Returns an access type defined in the IOHIDAccessType enumerator.
+ */
+IOHIDAccessType IOHIDCheckAccess(IOHIDRequestType requestType)
+__OSX_AVAILABLE(10.15) __IOS_AVAILABLE(13.0) __TVOS_AVAILABLE(13.0) __WATCHOS_AVAILABLE(6.0);
+
+/*!
+ * @function IOHIDRequestAccess
+ *
+ * @abstract
+ * Requests access from the user for a specific IOHIDRequestType.
+ *
+ * @discussion
+ * Processes that wish to post events through the IOHIDPostEvent API, or receive
+ * reports through the IOHIDManager/IOHIDDevice API must be granted access first
+ * by the user. If you do not call this API, it will be called on your behalf
+ * when the API are used.
+ *
+ * @param requestType
+ * The request type defined in the IOHIDRequestType enumerator.
+ *
+ * @result
+ * Returns true if access was granted.
+ */
+bool IOHIDRequestAccess(IOHIDRequestType requestType)
+__OSX_AVAILABLE(10.15) __IOS_AVAILABLE(13.0) __TVOS_AVAILABLE(13.0) __WATCHOS_AVAILABLE(6.0);
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 

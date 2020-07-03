@@ -36,22 +36,15 @@
     IOHIDDevice is also a CFType object and as such conforms to all the 
     conventions expected such object.
     <p>
-    This documentation assumes that you have a basic understanding of the 
-    material contained in <a href="http://developer.apple.com/documentation/DeviceDrivers/Conceptual/AccessingHardware/index.html"><i>Accessing Hardware From Applications</i></a>
-    For definitions of I/O Kit terms used in this documentation, such as 
-    matching dictionary, family, and driver, see the overview of I/O Kit terms 
-    and concepts n the "Device Access and the I/O Kit" chapter of 
-    <i>Accessing Hardware From Applications</i>.
-
-    This documentation also assumes you have read <a href="http://developer.apple.com/documentation/DeviceDrivers/HumanInterfaceDeviceForceFeedback-date.html"><i>Human Interface Device & Force Feedback</i></a>.
-    Please review documentation before using this reference.
-    <p>
     All of the information described in this document is contained in the header 
     file <font face="Courier New,Courier,Monaco">IOHIDDevice.h</font> found at 
     <font face="Courier New,Courier,Monaco">/System/Library/Frameworks/IOKit.framework/Headers/hid/IOHIDDevice.h</font>.
 */
 
 __BEGIN_DECLS
+
+CF_ASSUME_NONNULL_BEGIN
+CF_IMPLICIT_BRIDGING_ENABLED
 
 /*!
 	@function   IOHIDDeviceGetTypeID
@@ -71,8 +64,8 @@ AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
     @result     Returns a new IOHIDDeviceRef.
 */
 CF_EXPORT
-IOHIDDeviceRef IOHIDDeviceCreate(
-                                CFAllocatorRef                  allocator, 
+IOHIDDeviceRef _Nullable IOHIDDeviceCreate(
+                                CFAllocatorRef _Nullable        allocator,
                                 io_service_t                    service)
 AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
 
@@ -161,7 +154,7 @@ AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
     @result     Returns CFTypeRef containing the property.
 */
 CF_EXPORT
-CFTypeRef IOHIDDeviceGetProperty(
+CFTypeRef _Nullable IOHIDDeviceGetProperty(
                                 IOHIDDeviceRef                  device, 
                                 CFStringRef                     key)
 AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
@@ -197,9 +190,9 @@ AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
     @result     Returns CFArrayRef containing multiple IOHIDElement object.
 */
 CF_EXPORT 
-CFArrayRef IOHIDDeviceCopyMatchingElements(
+CFArrayRef _Nullable IOHIDDeviceCopyMatchingElements(
                                 IOHIDDeviceRef                  device, 
-                                CFDictionaryRef                 matching, 
+                                CFDictionaryRef _Nullable       matching,
                                 IOOptionBits                    options)
 AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
 
@@ -237,9 +230,142 @@ void IOHIDDeviceUnscheduleFromRunLoop(
                                 CFStringRef                     runLoopMode)
 AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
 
+/*!
+ * @function IOHIDDeviceSetDispatchQueue
+ *
+ * @abstract
+ * Sets the dispatch queue to be associated with the IOHIDDevice.
+ * This is necessary in order to receive asynchronous events from the kernel.
+ *
+ * @discussion
+ * An IOHIDDevice should not be associated with both a runloop and
+ * dispatch queue. A call to IOHIDDeviceSetDispatchQueue should only be made once.
+ *
+ * If a dispatch queue is set but never used, a call to IOHIDDeviceCancel followed
+ * by IOHIDDeviceActivate should be performed in that order.
+ *
+ * After a dispatch queue is set, the IOHIDDevice must make a call to activate
+ * via IOHIDDeviceActivate and cancel via IOHIDDeviceCancel. All calls to "Register"
+ * functions should be done before activation and not after cancellation.
+ *
+ * @param device
+ * Reference to an IOHIDDevice
+ *
+ * @param queue
+ * The dispatch queue to which the event handler block will be submitted.
+ */
+CF_EXPORT
+void IOHIDDeviceSetDispatchQueue(
+                                IOHIDDeviceRef                  device,
+                                dispatch_queue_t                queue)
+__OSX_AVAILABLE(10.15) __IOS_AVAILABLE(13.0) __TVOS_AVAILABLE(13.0) __WATCHOS_AVAILABLE(6.0);
+
+/*!
+ * @function IOHIDDeviceSetCancelHandler
+ *
+ * @abstract
+ * Sets a cancellation handler for the dispatch queue associated with
+ * IOHIDDeviceSetDispatchQueue.
+ *
+ * @discussion
+ * The cancellation handler (if specified) will be will be submitted to the
+ * device's dispatch queue in response to a call to IOHIDDeviceCancel after
+ * all the events have been handled.
+ *
+ * IOHIDDeviceSetCancelHandler should not be used when scheduling with
+ * a run loop.
+ *
+ * The IOHIDDeviceRef should only be released after the device has been
+ * cancelled, and the cancel handler has been called. This is to ensure all
+ * asynchronous objects are released. For example:
+ *
+ *     dispatch_block_t cancelHandler = dispatch_block_create(0, ^{
+ *         CFRelease(device);
+ *     });
+ *     IOHIDDeviceSetCancelHandler(device, cancelHandler);
+ *     IOHIDDeviceActivate(device);
+ *     IOHIDDeviceCancel(device);
+ *
+ * @param device
+ * Reference to an IOHIDDevice.
+ *
+ * @param handler
+ * The cancellation handler block to be associated with the dispatch queue.
+ */
+CF_EXPORT
+void IOHIDDeviceSetCancelHandler(
+                                 IOHIDDeviceRef                 device,
+                                 dispatch_block_t               handler)
+__OSX_AVAILABLE(10.15) __IOS_AVAILABLE(13.0) __TVOS_AVAILABLE(13.0) __WATCHOS_AVAILABLE(6.0);
+
+/*!
+ * @function IOHIDDeviceActivate
+ *
+ * @abstract
+ * Activates the IOHIDDevice object.
+ *
+ * @discussion
+ * An IOHIDDevice object associated with a dispatch queue is created
+ * in an inactive state. The object must be activated in order to
+ * receive asynchronous events from the kernel.
+ *
+ * A dispatch queue must be set via IOHIDDeviceSetDispatchQueue before
+ * activation.
+ *
+ * An activated device must be cancelled via IOHIDDeviceCancel. All calls
+ * to "Register" functions should be done before activation
+ * and not after cancellation.
+ *
+ * Calling IOHIDDeviceActivate on an active IOHIDDevice has no effect.
+ *
+ * @param device
+ * Reference to an IOHIDDevice
+ */
+CF_EXPORT
+void IOHIDDeviceActivate(
+                                 IOHIDDeviceRef                 device)
+__OSX_AVAILABLE(10.15) __IOS_AVAILABLE(13.0) __TVOS_AVAILABLE(13.0) __WATCHOS_AVAILABLE(6.0);
+
+/*!
+ * @function IOHIDDeviceCancel
+ *
+ * @abstract
+ * Cancels the IOHIDDevice preventing any further invocation
+ * of its event handler block.
+ *
+ * @discussion
+ * Cancelling prevents any further invocation of the event handler block for
+ * the specified dispatch queue, but does not interrupt an event handler
+ * block that is already in progress.
+ *
+ * Explicit cancellation of the IOHIDDevice is required, no implicit
+ * cancellation takes place.
+ *
+ * Calling IOHIDDeviceCancel on an already cancelled queue has no effect.
+ *
+ * The IOHIDDeviceRef should only be released after the device has been
+ * cancelled, and the cancel handler has been called. This is to ensure all
+ * asynchronous objects are released. For example:
+ *
+ *     dispatch_block_t cancelHandler = dispatch_block_create(0, ^{
+ *         CFRelease(device);
+ *     });
+ *     IOHIDDeviceSetCancelHandler(device, cancelHandler);
+ *     IOHIDDeviceActivate(device);
+ *     IOHIDDeviceCancel(device);
+ *
+ * @param device
+ * Reference to an IOHIDDevice
+ */
+CF_EXPORT
+void IOHIDDeviceCancel(
+                                 IOHIDDeviceRef                 device)
+__OSX_AVAILABLE(10.15) __IOS_AVAILABLE(13.0) __TVOS_AVAILABLE(13.0) __WATCHOS_AVAILABLE(6.0);
+
 /*! @function   IOHIDDeviceRegisterRemovalCallback
     @abstract   Registers a callback to be used when a IOHIDDevice is removed.
     @discussion In most cases this occurs when a device is unplugged.
+                If a dispatch queue is set, this call must occur before activation.
     @param      device Reference to an IOHIDDevice.
     @param      callback Pointer to a callback method of type IOHIDCallback.
     @param      context Pointer to data to be passed to the callback.
@@ -247,8 +373,8 @@ AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
 CF_EXPORT
 void IOHIDDeviceRegisterRemovalCallback( 
                                 IOHIDDeviceRef                  device, 
-                                IOHIDCallback                   callback, 
-                                void *                          context)
+                                IOHIDCallback _Nullable         callback,
+                                void * _Nullable                context)
 AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
 
 /*! @function   IOHIDDeviceRegisterInputValueCallback
@@ -259,15 +385,16 @@ AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
                 reports.  If more specific element values are desired, you can 
                 specify matching criteria via IOHIDDeviceSetInputValueMatching
                 and IOHIDDeviceSetInputValueMatchingMultiple.
+                If a dispatch queue is set, this call must occur before activation.
     @param      device Reference to an IOHIDDevice.
     @param      callback Pointer to a callback method of type IOHIDValueCallback.
     @param      context Pointer to data to be passed to the callback.
 */
 CF_EXPORT
 void IOHIDDeviceRegisterInputValueCallback(
-                                IOHIDDeviceRef                  device, 
-                                IOHIDValueCallback              callback, 
-                                void *                          context)
+                                IOHIDDeviceRef                  device,
+                                IOHIDValueCallback _Nullable    callback,
+                                void * _Nullable                context)
 AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
 
 /*! @function   IOHIDDeviceRegisterInputReportCallback
@@ -275,6 +402,7 @@ AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
                 by the device.
     @discussion An input report is an interrupt driver report issued by the 
                 device.
+                If a dispatch queue is set, this call must occur before activation.
     @param      device Reference to an IOHIDDevice.
     @param      report Pointer to preallocated buffer in which to copy inbound
                 report data.
@@ -288,8 +416,8 @@ void IOHIDDeviceRegisterInputReportCallback(
                                 IOHIDDeviceRef                  device, 
                                 uint8_t *                       report, 
                                 CFIndex                         reportLength,
-                                IOHIDReportCallback             callback, 
-                                void *                          context)
+                                IOHIDReportCallback _Nullable   callback,
+                                void * _Nullable                context)
 AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
 
 /*! @function   IOHIDDeviceRegisterInputReportWithTimeStampCallback
@@ -297,6 +425,7 @@ AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
                 by the device.
     @discussion An input report is an interrupt driver report issued by the 
                 device.
+                If a dispatch queue is set, this call must occur before activation.
     @param      device Reference to an IOHIDDevice.
     @param      report Pointer to preallocated buffer in which to copy inbound
                 report data.
@@ -310,8 +439,8 @@ void IOHIDDeviceRegisterInputReportWithTimeStampCallback(
                                 IOHIDDeviceRef                      device, 
                                 uint8_t *                           report, 
                                 CFIndex                             reportLength,
-                                IOHIDReportWithTimeStampCallback    callback, 
-                                void *                              context)
+                                IOHIDReportWithTimeStampCallback _Nullable  callback,
+                                void * _Nullable                    context)
 AVAILABLE_MAC_OS_X_VERSION_10_10_AND_LATER;
 
 /*! @function   IOHIDDeviceSetInputValueMatching
@@ -324,13 +453,14 @@ AVAILABLE_MAC_OS_X_VERSION_10_10_AND_LATER;
                 restart the matching process using the revised criteria.  If 
                 interested in multiple, specific device elements, please defer to
                 using IOHIDDeviceSetInputValueMatchingMultiple.
+                If a dispatch queue is set, this call must occur before activation.
     @param      device Reference to an IOHIDDevice.
     @param      matching CFDictionaryRef containg device matching criteria.
 */
 CF_EXPORT
 void IOHIDDeviceSetInputValueMatching(
                                 IOHIDDeviceRef                  device, 
-                                CFDictionaryRef                 matching)
+                                CFDictionaryRef _Nullable       matching)
 AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
                                 
 /*! @function   IOHIDDeviceSetInputValueMatchingMultiple
@@ -338,7 +468,8 @@ AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
                 IOHIDDeviceRegisterInputValueCallback.
     @discussion Matching keys are prefixed by kIOHIDElement and declared in 
                 <IOKit/hid/IOHIDKeys.h>.  This method is useful if interested 
-                in multiple, specific elements .
+                in multiple, specific elements.
+                If a dispatch queue is set, this call must occur before activation.
     @param      device Reference to an IOHIDDevice.
     @param      multiple CFArrayRef containing multiple CFDictionaryRef objects
                 containg input element matching criteria.
@@ -346,7 +477,7 @@ AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
 CF_EXPORT
 void IOHIDDeviceSetInputValueMatchingMultiple(
                                 IOHIDDeviceRef                  device, 
-                                CFArrayRef                      multiple)
+                                CFArrayRef _Nullable            multiple)
 AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
                                 
 /*! @function   IOHIDDeviceSetValue
@@ -408,8 +539,8 @@ IOReturn IOHIDDeviceSetValueWithCallback(
                                 IOHIDElementRef                 element, 
                                 IOHIDValueRef                   value, 
                                 CFTimeInterval                  timeout,
-                                IOHIDValueCallback              callback, 
-                                void *                          context)
+                                IOHIDValueCallback _Nullable    callback,
+                                void * _Nullable                context)
 AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
 
 /*! @function   IOHIDDeviceSetValueMultipleWithCallback
@@ -432,8 +563,8 @@ IOReturn IOHIDDeviceSetValueMultipleWithCallback(
                                 IOHIDDeviceRef                  device, 
                                 CFDictionaryRef                 multiple,
                                 CFTimeInterval                  timeout,
-                                IOHIDValueMultipleCallback      callback, 
-                                void *                          context)
+                                IOHIDValueMultipleCallback _Nullable    callback,
+                                void * _Nullable                context)
 AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
 
 /*! @function   IOHIDDeviceGetValue
@@ -452,8 +583,35 @@ CF_EXPORT
 IOReturn IOHIDDeviceGetValue(
                                 IOHIDDeviceRef                  device, 
                                 IOHIDElementRef                 element, 
-                                IOHIDValueRef *                 pValue)
+                                IOHIDValueRef _Nonnull * _Nonnull   pValue)
 AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
+
+
+typedef CF_ENUM(uint32_t, IOHIDDeviceGetValueOptions) {
+    kIOHIDDeviceGetValueWithUpdate        = 0x00020000,   //  force value update (get report will be send to the device)
+    kIOHIDDeviceGetValueWithoutUpdate     = 0x00040000    //  get last value
+};
+
+
+/*! @function   IOHIDDeviceGetValueWithOptions
+ @abstract   Gets a value for an element.
+ @discussion This method behaves synchronously and return back immediately
+ for input type element.  If requesting a value for a feature
+ element, this will block until the report has been issued to the
+ device.  If obtaining values for multiple elements you may want
+ to consider using IOHIDDeviceCopyValueMultiple or IOHIDTransaction.
+ @param      device Reference to an IOHIDDevice.
+ @param      element IOHIDElementRef whose value is to be obtained.
+ @param      pValue Pointer to IOHIDValueRef to be obtained.
+ @param      options (see IOHIDDeviceGetValueOptions).
+ @result     Returns kIOReturnSuccess if successful.
+ */
+IOReturn IOHIDDeviceGetValueWithOptions (
+                                        IOHIDDeviceRef                      device,
+                                        IOHIDElementRef                     element,
+                                        IOHIDValueRef  _Nonnull * _Nonnull  pValue,
+                                        uint32_t                            options)
+AVAILABLE_MAC_OS_X_VERSION_10_13_AND_LATER;
 
 /*! @function   IOHIDDeviceCopyValueMultiple
     @abstract   Copies a values for multiple elements.
@@ -472,7 +630,7 @@ CF_EXPORT
 IOReturn IOHIDDeviceCopyValueMultiple(
                                 IOHIDDeviceRef                  device, 
                                 CFArrayRef                      elements, 
-                                CFDictionaryRef *               pMultiple)
+                                CFDictionaryRef _Nullable * _Nullable   pMultiple)
 AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
 
 /*! @function   IOHIDDeviceGetValueWithCallback
@@ -495,10 +653,10 @@ CF_EXPORT
 IOReturn IOHIDDeviceGetValueWithCallback(
                                 IOHIDDeviceRef                  device, 
                                 IOHIDElementRef                 element, 
-                                IOHIDValueRef *                 pValue,
+                                IOHIDValueRef _Nonnull * _Nonnull    pValue,
                                 CFTimeInterval                  timeout,
-                                IOHIDValueCallback              callback, 
-                                void *                          context)
+                                IOHIDValueCallback _Nullable    callback,
+                                void * _Nullable                context)
 AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
 
 
@@ -519,13 +677,14 @@ AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
     @result     Returns kIOReturnSuccess if successful.
 */
 CF_EXPORT
+
 IOReturn IOHIDDeviceCopyValueMultipleWithCallback(
                                 IOHIDDeviceRef                  device, 
                                 CFArrayRef                      elements, 
-                                CFDictionaryRef *               pMultiple,
+                                CFDictionaryRef _Nullable * _Nullable   pMultiple,
                                 CFTimeInterval                  timeout,
-                                IOHIDValueMultipleCallback      callback, 
-                                void *                          context)
+                                IOHIDValueMultipleCallback _Nullable    callback,
+                                void * _Nullable                context)
 AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
                                 
 /*! @function   IOHIDDeviceSetReport
@@ -577,8 +736,8 @@ IOReturn IOHIDDeviceSetReportWithCallback(
                                 const uint8_t *                 report,
                                 CFIndex                         reportLength,
                                 CFTimeInterval                  timeout,
-                                IOHIDReportCallback             callback,
-                                void *                          context)
+                                IOHIDReportCallback _Nullable   callback,
+                                void * _Nullable                context)
 AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
 
 /*! @function   IOHIDDeviceGetReport
@@ -641,7 +800,10 @@ IOReturn IOHIDDeviceGetReportWithCallback(
                                 IOHIDReportCallback             callback,
                                 void *                          context)
 AVAILABLE_MAC_OS_X_VERSION_10_5_AND_LATER;
-                                
+
+CF_IMPLICIT_BRIDGING_DISABLED
+CF_ASSUME_NONNULL_END
+
 __END_DECLS
 
 #endif /* _IOKIT_HID_IOHIDDEVICE_USER_H */

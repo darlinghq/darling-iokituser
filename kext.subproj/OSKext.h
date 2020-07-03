@@ -38,6 +38,7 @@ __BEGIN_DECLS
 #include <System/libkern/OSKextLibPrivate.h>
 #include <mach/mach.h>
 #include <mach-o/arch.h>
+#include <AvailabilityMacros.h>
 
 // xxx - should I use "Clear" everywhere I use "Flush"
 
@@ -72,8 +73,9 @@ __BEGIN_DECLS
  */
 typedef struct __OSKext * OSKextRef;
 
-#define kOSKextBundleExtension  "kext"
-#define kOSKextMkextExtension   "mkext"
+#define kOSKextBundleExtension          "kext"
+#define kOSKextMkextExtension           "mkext"
+#define kOSKextDriverKitBundleExtension "dext"
 
 /*!
  * @typedef OSKextDiagnosticsFlags
@@ -208,6 +210,18 @@ OSKextGetArchitecture(void)
 CF_EXPORT const NXArchInfo *
 OSKextGetRunningKernelArchitecture(void)
                 __OSX_AVAILABLE_STARTING(__MAC_10_6, __IPHONE_3_2);
+
+/*!
+ * @function OSKextSetExecutableSuffix
+ * @abstract
+ * Set the suffix for kext executables explicitly or derived from a kernel path.
+ */
+CF_EXPORT void
+OSKextSetExecutableSuffix(const char * suffix, const char * kernelPath)
+#if defined(__MAC_10_12)
+                          __OSX_AVAILABLE_STARTING(__MAC_10_12, __IPHONE_10_0);
+#endif
+;
 
 /*!
  * @function OSKextSetLogFilter
@@ -1205,6 +1219,28 @@ OSKextIsLibrary(OSKextRef aKext)
 CF_EXPORT Boolean
 OSKextDeclaresExecutable(OSKextRef aKext)
                 __OSX_AVAILABLE_STARTING(__MAC_10_6, __IPHONE_3_2);
+
+/*!
+ * @function OSKextDeclaresUserExecutable
+ * @abstract Returns whether a kext declares a DriverKit executable.
+ *
+ * @param    aKext  The kext to examine.
+ * @result
+ * <code>true</code> if <code>aKext</code> has a CFBundlePackageType
+ * property equal to DEXT, <code>false</code> otherwise.
+ *
+ * @discussion
+ * A DriverKit kext is a kext which contains no kernel space executable code,
+ * a property list describing its properties and personalities, and one or
+ * more bundles containing executable code to be launched in userspace when
+ * the kext is loaded.
+ */
+CF_EXPORT Boolean
+OSKextDeclaresUserExecutable(OSKextRef aKext)
+#if defined(__MAC_10_15)
+                __OSX_AVAILABLE_STARTING(__MAC_10_15, __IPHONE_13_0)
+#endif
+;
 
 /*!
  * @function OSKextHasLogOrDebugFlags
@@ -2469,6 +2505,35 @@ OSKextCopyLoadedKextInfo(
     CFArrayRef infoKeys)
                 __OSX_AVAILABLE_STARTING(__MAC_10_7, __IPHONE_4_3);
 
+
+CF_EXPORT CFDictionaryRef
+OSKextCopyLoadedKextInfoByUUID(
+    CFArrayRef kextIdentifiers,
+    CFArrayRef infoKeys)
+#if defined(__MAC_10_12)
+                __OSX_AVAILABLE_STARTING(__MAC_10_12, __IPHONE_10_0)
+#endif
+;
+
+/*!
+ * @function OSKextCopyUUIDForAddress
+ * @abstract
+ * Returns the compiler-generated UUID of a kext given an address matching its range.
+ *
+ * @param    address   Address of the instruction that needs to be looked up
+ *
+ * @result
+ * A CFData object containing the UUID of the kext's executable
+ * for an <code>address</code> that falls within the range of a loaded kext
+ *
+ */
+CF_EXPORT CFDataRef
+OSKextCopyUUIDForAddress(uint64_t address)
+#if defined(__MAC_10_12)
+__OSX_AVAILABLE_STARTING(__MAC_10_12, __IPHONE_10_0)
+#endif
+;
+
 /*!
  * @function OSKextReadLoadedKextInfo
  * @abstract Updates kext objects with load info from the kernel.
@@ -2973,6 +3038,7 @@ typedef uint32_t OSKextRequiredFlags;
 #define kOSKextOSBundleRequiredNetworkRootFlag   0x1ULL << 2
 #define kOSKextOSBundleRequiredSafeBootFlag      0x1ULL << 3
 #define kOSKextOSBundleRequiredConsoleFlag       0x1ULL << 4
+#define kOSKextOSBundleRequiredDriverKitFlag     0x1ULL << 5
 
 /*!
  * @function OSKextIsFromMkext

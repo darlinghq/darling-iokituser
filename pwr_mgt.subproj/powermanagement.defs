@@ -30,6 +30,8 @@ import <IOKit/pwr_mgt/powermanagement_mig.h>;
 subsystem powermanagement 73000; 
 serverprefix _;
 
+UseSpecialReplyPort 1;
+
 routine io_pm_get_value_int(
             server      : mach_port_t;
 ServerAuditToken token  : audit_token_t;
@@ -45,12 +47,6 @@ ServerAuditToken token  : audit_token_t;
 
 // PM Settings
 routine io_pm_force_active_settings(
-            server      : mach_port_t;
-ServerAuditToken token  : audit_token_t;
-        in  profiles    : pointer_t;
-        out return_val  : int);
-
-routine io_pm_set_active_profile(
             server      : mach_port_t;
 ServerAuditToken token  : audit_token_t;
         in  profiles    : pointer_t;
@@ -102,6 +98,7 @@ ServerAuditToken token  : audit_token_t;
         in  props       : pointer_t;
         out disableAppSleep: int;
         out enableAppSleep: int;
+        out enTrIntensity: int;
         out return_code : int);
 
 routine io_pm_assertion_retain_release(
@@ -159,7 +156,7 @@ routine io_pm_get_uuid(
 // IOPMConnection
 routine io_pm_connection_create(
             server      : mach_port_t;
-        in task_in       : mach_port_t;
+ServerAuditToken token  : audit_token_t;
         in name         : string_t;
         in interests    : int;
         out connection_id : uint32_t;
@@ -167,6 +164,7 @@ routine io_pm_connection_create(
 
 routine io_pm_connection_schedule_notification(
             server      : mach_port_t;
+ServerAuditToken token  : audit_token_t;
         in connection_id : uint32_t;
         in notify_port  : mach_port_t;
         in disable      : int;
@@ -179,16 +177,11 @@ routine io_pm_connection_release(
 
 routine io_pm_connection_acknowledge_event(
            server       : mach_port_t;
+ServerAuditToken token  : audit_token_t;
         in connection_id : uint32_t;
         in messageToken : int;
         in options      : pointer_t;
         out return_code : int);
-
-routine io_pm_connection_copy_status(
-           server       : mach_port_t;
-        in status_index : int;
-        out status_data : pointer_t;
-        out return_val  : int);
 
 // OS controlled power sources
 routine io_ps_new_pspowersource(
@@ -211,6 +204,7 @@ ServerAuditToken token  : audit_token_t;
 
 routine io_ps_copy_powersources_info(
         server          : mach_port_t;
+ServerAuditToken token  : audit_token_t;
         in pstype       : int;
        out powersources : pointer_t, dealloc;
        out return_code  : int);
@@ -254,7 +248,6 @@ routine io_pm_set_dw_linger_interval(
             server      : mach_port_t;
 ServerAuditToken token  : audit_token_t;
             in  newInterval   : uint32_t;
-            out oldInterval   : uint32_t;
             out return_val    : int);
 
 routine io_pm_change_sa_assertion_behavior(
@@ -304,3 +297,8 @@ ServerAuditToken token  : audit_token_t;
             out statsData: pointer_t, dealloc;
             out return_code : int);
 
+routine io_pm_set_exception_limits(
+            server      : mach_port_t;
+ServerAuditToken token  : audit_token_t;
+            in  props   : pointer_t;
+            out return_code : int);

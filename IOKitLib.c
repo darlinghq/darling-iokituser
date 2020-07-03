@@ -26,16 +26,16 @@
 #endif
 
 #include <IOKit/IOTypes.h>
-#include <MacTypes.h>
 #include <device/device_types.h>
 
 #include <mach/mach.h>
 #include <mach/mach_port.h>
 
-#if TARGET_IPHONE_SIMULATOR
+#if TARGET_OS_SIMULATOR
 #include <servers/bootstrap.h>
 #endif
 
+#include <stdbool.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <sys/file.h>
@@ -44,12 +44,13 @@
 #include <unistd.h>
 #include <asl.h>
 #include <dispatch/dispatch.h>
-#include <dispatch/private.h> 
+#include <dispatch/private.h>
 #include <xpc/xpc.h>
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreFoundation/CFMachPort.h>
 
+#include <libkern/OSAtomic.h>
 
 #include <IOKit/IOBSD.h>
 #include <IOKit/IOKitLib.h>
@@ -90,6 +91,12 @@ typedef struct OSNotificationHeader NotificationHeader;
 
 #endif
 
+#if IOKIT_SERVER_VERSION >= 20190926 && !TARGET_OS_SIMULATOR
+#define IOKIT_HAS_GET_PROPERTY_WITH_BUF 1
+#else
+#define IOKIT_HAS_GET_PROPERTY_WITH_BUF 0
+#endif
+
 uint64_t 
 gIOKitLibServerVersion;
 CFOptionFlags
@@ -115,7 +122,7 @@ __IOGetDefaultMasterPort()
 }
 
 kern_return_t
-#if TARGET_IPHONE_SIMULATOR
+#if TARGET_OS_SIMULATOR
 IOMasterPort( mach_port_t bootstrapPort, mach_port_t * masterPort )
 #else
 IOMasterPort( mach_port_t bootstrapPort __unused, mach_port_t * masterPort )
@@ -124,7 +131,7 @@ IOMasterPort( mach_port_t bootstrapPort __unused, mach_port_t * masterPort )
     kern_return_t result = KERN_SUCCESS;
     mach_port_t host_port = 0;
 
-#if TARGET_IPHONE_SIMULATOR
+#if TARGET_OS_SIMULATOR
     /* Defaulting to bypass until <rdar://problem/13141176> is addressed */
     static boolean_t use_iokitsimd = 0;
     static dispatch_once_t once;
@@ -149,11 +156,6 @@ IOMasterPort( mach_port_t bootstrapPort __unused, mach_port_t * masterPort )
             bootstrapPort = bootstrap_port;
         return bootstrap_look_up(bootstrapPort, "com.apple.iokitsimd", masterPort);
     }
-#endif
-#ifdef DARLING
-    if (bootstrapPort == MACH_PORT_NULL)
-        bootstrapPort = bootstrap_port;
-    return bootstrap_look_up(bootstrapPort, "org.darlinghq.iokitd", masterPort);
 #endif
 
     host_port = mach_host_self();
@@ -210,10 +212,21 @@ kern_return_t
 IOObjectRetain(
 	io_object_t	object )
 {
-    return( mach_port_mod_refs(mach_task_self(),
+	kern_return_t ret;
+
+    ret = mach_port_mod_refs(mach_task_self(),
                               object,
                               MACH_PORT_RIGHT_SEND,
-                              1 ));
+                              1);
+
+	if (KERN_INVALID_RIGHT == ret) {
+		ret = mach_port_mod_refs(mach_task_self(),
+								  object,
+								  MACH_PORT_RIGHT_DEAD_NAME,
+								  1);
+	}
+
+	return ret;
 }
 
 kern_return_t
@@ -233,7 +246,7 @@ _IOObjectGetClass(
     CFTypeRef overrideType  = NULL;
     boolean_t override      = false;
 
-#if !TARGET_IPHONE_SIMULATOR
+#if !TARGET_OS_SIMULATOR
     if ( (options & kIOClassNameOverrideNone) == 0 ) {
         overrideType = IORegistryEntryCreateCFProperty(object, CFSTR(kIOClassNameOverrideKey), kCFAllocatorDefault, 0);
         
@@ -244,7 +257,7 @@ _IOObjectGetClass(
             CFRelease(overrideType);
         }
     }
-#endif /* !TARGET_IPHONE_SIMULATOR */
+#endif /* !TARGET_OS_SIMULATOR */
 
     return( override ? kIOReturnSuccess : io_object_get_class( object, className ));
 }
@@ -362,7 +375,7 @@ _IOObjectConformsTo(
 		object, (char *) className, &conforms ))
 	conforms = 0;
     
-#if !TARGET_IPHONE_SIMULATOR
+#if !TARGET_OS_SIMULATOR
     if ( !conforms && ((options & kIOClassNameOverrideNone) == 0) ) {
         CFTypeRef overrideType = IORegistryEntryCreateCFProperty(object, CFSTR(kIOClassNameOverrideKey), kCFAllocatorDefault, 0);
         
@@ -377,7 +390,7 @@ _IOObjectConformsTo(
             CFRelease(overrideType);
         }
     }
-#endif /* !TARGET_IPHONE_SIMULATOR */
+#endif /* !TARGET_OS_SIMULATOR */
     
     return( conforms );
 }
@@ -809,31 +822,49 @@ IONotificationPortCreate(
     return notify;
 }
 
+static void
+IONotificationPortRelease(void *ctxt)
+{
+	IONotificationPortRef notify = ctxt;
+
+	if (OSAtomicDecrement32(&notify->refcount) < 0) {
+		/* Note: dispatch sources require resources they are monitoring to be
+		 * destroyed after their corresponding kevent has been unregistered.
+		 *
+		 * We hence use an internal refcount to make sure the port destruction
+		 * is delayed until it is safe: the IONotificationPort and each each
+		 * created dispatch source own a reference.
+		 *
+		 * The refcount encoding is offset by 1 so that its initial value (a
+		 * single refcount owned by the IONotificationPort) can be 0. So
+		 * we free resources when the refcount encoding becomes -1.
+		 */
+		mach_port_mod_refs(mach_task_self(), notify->wakePort,
+				MACH_PORT_RIGHT_RECEIVE, -1);
+		mach_port_deallocate(mach_task_self(), notify->masterPort);
+		free( notify );
+	}
+}
+
 void
 IONotificationPortDestroy(
 	IONotificationPortRef	notify )
 {
+	if (notify->cfmachPort) {
+		CFMachPortInvalidate(notify->cfmachPort);
+		CFRelease(notify->cfmachPort);
+	}
 
-    if (notify->cfmachPort) {
-        CFMachPortInvalidate(notify->cfmachPort);
-        CFRelease(notify->cfmachPort);
-    }
+	if (notify->source) {
+		CFRelease(notify->source);
+	}
 
-    if( notify->source) {
-        CFRelease(notify->source);
-    }
+	if (notify->dispatchSource) {
+		dispatch_source_cancel(notify->dispatchSource);
+		dispatch_release(notify->dispatchSource);
+	}
 
-    if (notify->dispatchSource) {
-        dispatch_source_cancel(notify->dispatchSource);
-        dispatch_release(notify->dispatchSource);
-    }
-
-    mach_port_mod_refs(mach_task_self(), notify->wakePort, 
-                        MACH_PORT_RIGHT_RECEIVE, -1);
-
-    mach_port_deallocate(mach_task_self(), notify->masterPort);
-
-    free( notify );
+	IONotificationPortRelease(notify);
 }
 
 CFRunLoopSourceRef
@@ -896,6 +927,17 @@ IONotificationPortGetMachPort(
     return( notify->wakePort );
 }
 
+kern_return_t
+IONotificationPortSetImportanceReceiver(IONotificationPortRef notify)
+{
+	kern_return_t kr;
+
+	kr = mach_port_set_attributes(mach_task_self(), notify->wakePort, MACH_PORT_IMPORTANCE_RECEIVER, (mach_port_info_t)NULL, 0);
+	assert(kr == KERN_SUCCESS);
+
+	return (kr);
+}
+
 boolean_t _IODispatchCalloutWithDispatch(mach_msg_header_t *msg, mach_msg_header_t *reply)
 {
     mig_reply_setup(msg, reply);
@@ -910,30 +952,26 @@ boolean_t _IODispatchCalloutWithDispatch(mach_msg_header_t *msg, mach_msg_header
 void
 IONotificationPortSetDispatchQueue(IONotificationPortRef notify, dispatch_queue_t queue)
 {
-    dispatch_source_t dispatchSource;
+	dispatch_source_t dispatchSource;
 
-    if (notify->dispatchSource)
-    {
-        dispatch_source_cancel(notify->dispatchSource);
-        dispatch_release(notify->dispatchSource);
-        notify->dispatchSource = NULL;
-    }
+	if (notify->dispatchSource) {
+		dispatch_source_cancel(notify->dispatchSource);
+		dispatch_release(notify->dispatchSource);
+		notify->dispatchSource = NULL;
+	}
 
-    if (!queue) return;
+	if (!queue) return;
 
-    dispatchSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_MACH_RECV, notify->wakePort, 0, queue);
-    dispatch_source_set_event_handler(dispatchSource, ^{
-        dispatch_mig_server(dispatchSource, MAX_MSG_SIZE, _IODispatchCalloutWithDispatch);
-    });
-    notify->dispatchSource = dispatchSource;
+	OSAtomicIncrement32(&notify->refcount);
+	dispatchSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_MACH_RECV, notify->wakePort, 0, queue);
+	dispatch_set_context(dispatchSource, notify);
+	dispatch_source_set_event_handler(dispatchSource, ^{
+		dispatch_mig_server(dispatchSource, MAX_MSG_SIZE, _IODispatchCalloutWithDispatch);
+	});
+	dispatch_source_set_cancel_handler_f(dispatchSource, IONotificationPortRelease);
 
-   /* Note: normally, dispatch sources for mach ports should destroy the underlying
-    * mach port in their cancellation handler.  We take care to destroy the port
-    * after we destroy the source in IONotificationPortDestroy(), which gives us the
-    * flexibility of changing the queue used for the dispatch source.
-    */
-
-    dispatch_resume(notify->dispatchSource);
+	notify->dispatchSource = dispatchSource;
+	dispatch_activate(dispatchSource);
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
@@ -2345,16 +2383,25 @@ IORegistryEntryCreateCFProperties(
         CFAllocatorRef		allocator,
 	IOOptionBits   options __unused )
 {
-    kern_return_t 	kr;
-    uint32_t	 	size;
-    char *	 	propertiesBuffer;
-    CFStringRef  	errorString;
-    const char * 	cstr;
+    kern_return_t	kr;
+    uint32_t		size;
+    char *		propertiesBuffer;
+    CFStringRef		errorString;
+    const char *	cstr;
+#if IOKIT_HAS_GET_PROPERTY_WITH_BUF
+    char		sBuf[2048];
+    mach_vm_size_t      sBufSize = sizeof(sBuf);
+#endif // IOKIT_HAS_GET_PROPERTY_WITH_BUF
 
 #if IOKIT_SERVER_VERSION >= 20140421
     if (kIOCFSerializeToBinary & gIOKitLibSerializeOptions)
     {
+#if IOKIT_HAS_GET_PROPERTY_WITH_BUF
+	kr = io_registry_entry_get_properties_bin_buf(entry,
+	    (mach_vm_address_t)sBuf, &sBufSize, &propertiesBuffer, &size);
+#else
 	kr = io_registry_entry_get_properties_bin(entry, &propertiesBuffer, &size);
+#endif // IOKIT_HAS_GET_PROPERTY_WITH_BUF
     }
     else
 #endif /* IOKIT_SERVER_VERSION >= 20140421 */
@@ -2364,16 +2411,28 @@ IORegistryEntryCreateCFProperties(
 
     if (kr != kIOReturnSuccess) return (kr);
 
-    *properties = (CFMutableDictionaryRef) IOCFUnserializeWithSize(propertiesBuffer, size, allocator,
-								  0, &errorString);
+    if (propertiesBuffer) {
+	    *properties = (CFMutableDictionaryRef) IOCFUnserializeWithSize(propertiesBuffer, size, allocator,
+									  0, &errorString);
+    } else {
+#if IOKIT_HAS_GET_PROPERTY_WITH_BUF
+        *properties = (CFMutableDictionaryRef) IOCFUnserializeWithSize(sBuf, sBufSize, allocator,
+                                        0, &errorString);
+#else
+        *properties = NULL;
+#endif // IOKIT_HAS_GET_PROPERTY_WITH_BUF
+    }
+
     if (!(*properties) && errorString)
     {
         if ((cstr = CFStringGetCStringPtr(errorString, kCFStringEncodingMacRoman))) printf("%s\n", cstr);
 	CFRelease(errorString);
     }
 
-    // free propertiesBuffer !
-    vm_deallocate(mach_task_self(), (vm_address_t)propertiesBuffer, size);
+    if (propertiesBuffer) {
+	    // free propertiesBuffer !
+	    vm_deallocate(mach_task_self(), (vm_address_t)propertiesBuffer, size);
+    }
 
     return( *properties ? kIOReturnSuccess : kIOReturnInternalError );
 }
@@ -2397,12 +2456,16 @@ IORegistryEntrySearchCFProperty(
 	IOOptionBits		options )
 {
     IOReturn		kr;
-    CFTypeRef		type;
-    uint32_t	 	size;
-    char *	 	propertiesBuffer;
-    CFStringRef  	errorString;
-    const char *    	cStr;
-    char *	    	buffer = NULL;
+    CFTypeRef		type = NULL;
+    uint32_t		size;
+    char *		propertiesBuffer;
+    CFStringRef		errorString;
+    const char *	cStr;
+    char *		buffer = NULL;
+#if IOKIT_HAS_GET_PROPERTY_WITH_BUF
+    char		sBuf[2048];
+    mach_vm_size_t      sBufSize = sizeof(sBuf);
+#endif // IOKIT_HAS_GET_PROPERTY_WITH_BUF
 
     cStr = CFStringGetCStringPtr( key, kCFStringEncodingMacRoman);
     if( !cStr)
@@ -2413,14 +2476,18 @@ IORegistryEntrySearchCFProperty(
         if( buffer && CFStringGetCString( key, buffer, bufferSize, kCFStringEncodingMacRoman))
             cStr = buffer;
     }
-
-    if (!cStr) kr = kIOReturnError;
+if (!cStr) kr = kIOReturnError;
 #if IOKIT_SERVER_VERSION >= 20140421
     else if (kIOCFSerializeToBinary & gIOKitLibSerializeOptions)
     {
 	if (!(kIORegistryIterateRecursively & options)) plane = "\0";
+#if IOKIT_HAS_GET_PROPERTY_WITH_BUF
+        kr = io_registry_entry_get_property_bin_buf(entry, (char *) plane, (char *) cStr,
+            options, (mach_vm_address_t)sBuf, &sBufSize, &propertiesBuffer, &size);
+#else
         kr = io_registry_entry_get_property_bin(entry, (char *) plane, (char *) cStr,
                                                 options, &propertiesBuffer, &size);
+#endif // IOKIT_HAS_GET_PROPERTY_WITH_BUF
     }
 #endif /* IOKIT_SERVER_VERSION >= 20140421 */
     else if (kIORegistryIterateRecursively & options)
@@ -2436,16 +2503,25 @@ IORegistryEntrySearchCFProperty(
     if (buffer) free(buffer);
     if (kr != kIOReturnSuccess) return (NULL);
 
-    type = (CFMutableDictionaryRef) IOCFUnserializeWithSize(propertiesBuffer, size, allocator,
-							    0, &errorString);
+    if (propertiesBuffer) {
+        type = (CFMutableDictionaryRef) IOCFUnserializeWithSize(propertiesBuffer, size, allocator,
+                                    0, &errorString);
+#if IOKIT_HAS_GET_PROPERTY_WITH_BUF
+    } else {
+	    type = (CFMutableDictionaryRef) IOCFUnserializeWithSize(sBuf, sBufSize, allocator,
+								    0, &errorString);
+#endif // IOKIT_HAS_GET_PROPERTY_WITH_BUF
+    }
     if (!type && errorString)
     {
         if ((cStr = CFStringGetCStringPtr(errorString, kCFStringEncodingMacRoman))) printf("%s\n", cStr);
 	CFRelease(errorString);
     }
 
-    // free propertiesBuffer !
-    vm_deallocate(mach_task_self(), (vm_address_t)propertiesBuffer, size);
+    if (propertiesBuffer) {
+	    // free propertiesBuffer !
+	    vm_deallocate(mach_task_self(), (vm_address_t)propertiesBuffer, size);
+    }
 
     return( type );
 }

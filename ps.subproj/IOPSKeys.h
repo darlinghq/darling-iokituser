@@ -143,15 +143,20 @@
 
 /*!
  * @define      kIOPSLowWarnLevelKey 
+ * @abstract    Specifies the battery capacity percentage at which device is considered to be low on power.
+ *              Typically used to show initial warning to the user.
  *
- * @abstract    Key for the "Warning" UPS low power trigger-level. Default is 50%.
+ *              Holds a CFNumber, with possible values between 0-100.
 */
 #define kIOPSLowWarnLevelKey           "Low Warn Level"
 
 /*!
  * @define      kIOPSDeadWarnLevelKey 
+ * @abstract    Specifies the battery capacity percentage at which device is considered to be very low on power and
+ *              soon will not be functional. Typically used to show final warning to the user.
  *
- * @abstract    Key for the "Shutdown System" low power trigger-level. Default is 20%.
+ *              Holds a CFNumber, with possible values between 0-100.
+ *
  */
 #define kIOPSDeadWarnLevelKey          "Shutdown Level"
 
@@ -239,6 +244,16 @@
  */
 #define kIOPSCommandSendCurrentStateOfCharge       "Send Current State of Charge"
 
+/*!
+ * @define      kIOPSCommandSendCurrentTemperature
+ *
+ * @abstract Tell the UPS the device's current temperature
+ * @discussion
+ *              <ul>
+ *                  <li>The matching argument should be a CFNumber of kCFNumberIntType specifying the device's
+ *                  <li>temperature in degrees deciKelvin.
+ */
+#define kIOPSCommandSendCurrentTemperature       "Send Current Temperature"
 
 /*!
  * @group       Power Source data keys
@@ -266,13 +281,12 @@
 /*!
  * @define      kIOPSPowerSourceIDKey
  *
- * @abstract    CFNumber key uniquely identifying a UPS attached to the system.
+ * @abstract    CFNumber key uniquely identifying the power source.
  *
  * @discussion
  *              <ul>
- *              <li> Apple UPS power sources will publish this key.
- *              <li> Callers should not set this key; OS X power management will publish this key for UPS's.
- *              <li> Type CFNumber, kCFNumberIntType, uniquely identifying an attached UPS.
+ *              <li> Callers should not set this key; OS X power management will publish this key for all power sources
+ *              <li> Type CFNumber, kCFNumberIntType, uniquely identifying the power source
  *              </ul>
  */
  

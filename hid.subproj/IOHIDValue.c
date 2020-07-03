@@ -45,6 +45,7 @@ typedef struct __IOHIDValue
     CFRuntimeBase               cfBase;   // base CFType information
     
     IOHIDElementRef             element;
+    bool                        weakElementRef;
     uint64_t                    timeStamp;
     uint32_t                    length;
     uint8_t *                   bytePtr;
@@ -104,8 +105,8 @@ IOHIDValueRef __IOHIDValueCreatePrivate(CFAllocatorRef allocator, CFAllocatorCon
 void __IOHIDValueRelease( CFTypeRef object )
 {
     IOHIDValueRef event = ( IOHIDValueRef ) object;
-
-    if (event->element) CFRelease(event->element);
+    
+    if (event->element && !event->weakElementRef) CFRelease(event->element);
 }
 
 IOHIDValueRef _IOHIDValueCreateWithElementValuePtr(CFAllocatorRef allocator, IOHIDElementRef element, IOHIDElementValue * pElementValue)
@@ -114,18 +115,18 @@ IOHIDValueRef _IOHIDValueCreateWithElementValuePtr(CFAllocatorRef allocator, IOH
     uint32_t        length  = 0;
 
     if ( !element || !pElementValue )
-        return NULL;
+        return (_Nonnull IOHIDValueRef)NULL;
         
-    length  = _IOHIDElementGetLength(element);
+    length  =  min(_IOHIDElementGetLength(element), (CFIndex)(pElementValue->totalSize - sizeof(*pElementValue) + sizeof(pElementValue->value)));
     event   = __IOHIDValueCreatePrivate(allocator, NULL, length);
 
     if (!event)
-        return NULL;
+        return (_Nonnull IOHIDValueRef)NULL;
         
     event->element      = (IOHIDElementRef)CFRetain(element);
     event->timeStamp    = *((uint64_t *)&(pElementValue->timestamp));
     event->length       = length;
-    
+  
     __IOHIDValueConvertWordToByte((const uint32_t *)&(pElementValue->value[0]), event->bytes, length);
     
     return event;
@@ -138,14 +139,14 @@ IOHIDValueRef _IOHIDValueCreateWithStruct(CFAllocatorRef allocator, IOHIDElement
     uint32_t        length      = 0;
 
     if ( !element || !pEventStruct )
-        return NULL;
+        return (_Nonnull IOHIDValueRef)NULL;
         
     isLongValue = (pEventStruct->longValue && pEventStruct->longValueSize);
     length  = _IOHIDElementGetLength(element);
     event   = __IOHIDValueCreatePrivate(allocator, NULL, isLongValue ? 0 : length);
 
     if (!event)
-        return NULL;
+        return (_Nonnull IOHIDValueRef)NULL;
         
     event->element      = (IOHIDElementRef)CFRetain(element);
     event->timeStamp    = *((uint64_t *)&(pEventStruct->timestamp));
@@ -168,13 +169,13 @@ IOHIDValueRef IOHIDValueCreateWithIntegerValue(CFAllocatorRef allocator, IOHIDEl
     uint64_t        tempValue;
 
     if ( !element )
-        return NULL;
+        return (_Nonnull IOHIDValueRef)NULL;
 
     length  = _IOHIDElementGetLength(element);
     event   = __IOHIDValueCreatePrivate(allocator, NULL, length);
 
     if (!event)
-        return NULL;
+        return (_Nonnull IOHIDValueRef)NULL;
         
     event->element      = (IOHIDElementRef)CFRetain(element);
     event->timeStamp    = timeStamp;
@@ -230,6 +231,28 @@ IOHIDValueRef IOHIDValueCreateWithBytesNoCopy(CFAllocatorRef allocator, IOHIDEle
     return event;
 }
 
+// creates a IOHIDValueRef that doesn't cause a retain cycle between element <-> value
+// the assumption here is that the value will only exist during the lifetime
+// of the element.
+IOHIDValueRef _IOHIDValueCreateWithValue(CFAllocatorRef allocator, IOHIDValueRef value, IOHIDElementRef element)
+{
+    IOHIDValueRef result = NULL;
+    
+    result = __IOHIDValueCreatePrivate(allocator, NULL, value->length);
+    
+    if (!result) {
+        return NULL;
+    }
+    
+    result->element         = element; // NO RETAIN!
+    result->weakElementRef  = true; // So we don't release later
+    result->timeStamp       = value->timeStamp;
+    result->length          = value->length;
+    bcopy(value->bytes, result->bytes, value->length);
+    
+    return result;
+}
+
 
 IOHIDElementRef IOHIDValueGetElement(IOHIDValueRef event)
 {
@@ -256,11 +279,12 @@ double_t IOHIDValueGetScaledValue(IOHIDValueRef event, IOHIDValueScaleType type)
     CFIndex         logicalMin      = IOHIDElementGetLogicalMin(element);
     CFIndex         logicalMax      = IOHIDElementGetLogicalMax(element);
     CFIndex         logicalRange    = 0;
-    CFIndex         scaledMin       = 0;
-    CFIndex         scaledMax       = 0;
+    CFIndex         scaledMin       = IOHIDElementGetPhysicalMin(element);
+    CFIndex         scaledMax       = IOHIDElementGetPhysicalMax(element);
     CFIndex         scaledRange     = 0;
     double_t        granularity     = 0.0;
     double_t        returnValue     = 0.0;
+    double_t        exponent        = 0.0;
 
     if ( type == kIOHIDValueScaleTypeCalibrated ){
         IOHIDCalibrationInfo * calibrationInfo;
@@ -303,14 +327,22 @@ double_t IOHIDValueGetScaledValue(IOHIDValueRef event, IOHIDValueScaleType type)
 
             granularity = calibrationInfo->gran;
         }
-    } else { // kIOHIDValueScaleTypePhysical
-        scaledMin = IOHIDElementGetPhysicalMin(element);
-        scaledMax = IOHIDElementGetPhysicalMax(element);
+    } else if (type == kIOHIDValueScaleTypeExponent) {
+        uint8_t unitExp = IOHIDElementGetUnitExponent(element) & 0x0F;
+        
+        // Per HID spec:
+        // Exponent value of 0x1 - 0x7 is a positive exponent. Exponent value of
+        // 0x8 - 0xF is a negative exponent, where 0x8 is 10^-8 and 0xF is 10^-1
+        exponent = unitExp < 8 ? pow(10, unitExp) : 1.0 / pow(10, 0x10 - unitExp);
     }
-
+    
     logicalRange    = logicalMax - logicalMin;
     scaledRange     = scaledMax - scaledMin;
     returnValue     = ((double_t)(logicalValue - logicalMin) * (double_t)scaledRange / (double_t)logicalRange) + scaledMin;
+    
+    if (exponent) {
+        returnValue *= exponent;
+    }
 
     if ( granularity )
         returnValue = granularity * llround(returnValue / granularity);

@@ -47,6 +47,9 @@ enum {
     kIOPSReadUserVisible    = 4
 };
 
+
+
+
 /*!
  * @function    IOPSRequestBatteryUpdate
  * @abstract    Tell the battery driver to read the battery's state.
@@ -184,11 +187,18 @@ IOReturn        IOPSReleasePowerSource(IOPSPowerSourceID whichPS);
 #define kIOPSNotifyPercentChange                "com.apple.system.powersources.percent"
 
 /*!
+ * @define      kIOPSNotifyAdapterChange
+ * @abstract    Notify(3) key. The system delivers notifications on this key when
+ *              an adapter is connected or disconnected from the sytem.
+ */
+#define kIOPSNotifyAdapterChange                "com.apple.system.powermanagement.poweradapter"
+
+/*!
  * @function    IOPSGetPercentRemaining
- * @abstract    Get the percent charge remaining for the device’s power source(s).
- * @param       Returns the percent charge remaining (0 to 100).
- * @param       Returns true if the power source is being charged.
- * @param       Returns true if the power source is fully charged.
+ * @abstract    Get the percent charge remaining for the device power source(s).
+ * @param       percent - Returns the percent charge remaining (0 to 100).
+ * @param       isCharging - Returns true if the power source is being charged. Optional parameter.
+ * @param       isFullyCharged - Returns true if the power source is fully charged. Optional parameter.
  * @result      Returns kIOReturnSuccess on success, or an error code from IOReturn.h and
  *              also report the percent remaining as 100%.
  */
@@ -234,14 +244,13 @@ IOReturn IOPSGetSupportedPowerSources(IOPSPowerSourceIndex *active,
 #define kPSTimeRemainingNotifyFullyChargedBit   (1 << 21)
 #define kPSTimeRemainingNotifyBattSupportBit    (1 << 22)
 #define kPSTimeRemainingNotifyUPSSupportBit     (1 << 23)
-#if TARGET_OS_IPHONE
 #define kPSCriticalLevelBit                     (1 << 24)
 #define kPSRestrictedLevelBit                   (1 << 25)
 #define kPSTimeRemainingNotifyRawExternalBit    (1 << 26)
-#endif
+#define kPSTimeRemainingNotifyShowChargingUIBit (1 << 27)
+#define kPSTimeRemainingNotifyPlayChargingChimeBit (1 << 28)
 #define kPSTimeRemainingNotifyActivePS8BitsStarts   56
 
-#if TARGET_OS_IPHONE
 /*
  * Notify(3) string on which powerd posts a notification when system enters critical level
  */
@@ -250,7 +259,6 @@ IOReturn IOPSGetSupportedPowerSources(IOPSPowerSourceIndex *active,
  * Notify(3) string on which powerd posts a notification when system enters restricted mode
  */
 #define kIOPSNotifyRestrictedMode           "com.apple.system.powersources.restrictedmode"
-#endif
 
 /*!
  * @define      kIOPSBattLogEntryTime

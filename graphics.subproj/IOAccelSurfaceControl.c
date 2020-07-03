@@ -115,6 +115,7 @@ IOReturn IOAccelCreateAccelID(IOOptionBits options, IOAccelID * identifier)
         {
             err = IOServiceOpen(service, mach_task_self(), 0, &idConnect);
             IOObjectRelease(service);
+            if (kIOReturnSuccess != err) idConnect = MACH_PORT_NULL;
         }
     }
 
@@ -151,13 +152,15 @@ IOReturn IOAccelCreateSurface( io_service_t accelerator, UInt32 wID, eIOAccelSur
 {
         IOReturn        kr;
         io_connect_t    window = MACH_PORT_NULL;
+        uint32_t        type = (kIOAccelSurfaceModeSurface2 & modebits)
+                             ? kIOAccelSurface2ClientType : kIOAccelSurfaceClientType;
 
         *connect = NULL;
 
         /* Create a context */
         kr = IOServiceOpen( accelerator,
                     mach_task_self(),
-                    kIOAccelSurfaceClientType,
+                    type,
                     &window );
 
         if( kr != kIOReturnSuccess)

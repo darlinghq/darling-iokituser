@@ -167,6 +167,19 @@ mach_port_t
 IONotificationPortGetMachPort(
 	IONotificationPortRef	notify );
 
+/*! @function IONotificationPortSetImportanceReceiver
+    @abstract Configure a notification port to be an importance receiver.
+    @discussion Sets the MACH_PORT_IMPORTANCE_RECEIVER attribute on the underlying mach port.
+                Importance-donating messages sent to a notification port with this
+                attribute enabled will boost the importance of the receiving process for the
+                duration of the notification handler.
+    @param notify The notification object.
+    @result A kern_return_t error code. */
+
+kern_return_t
+IONotificationPortSetImportanceReceiver(
+	IONotificationPortRef	notify );
+
 /*! @function IONotificationPortSetDispatchQueue
     @abstract Sets a dispatch queue to be used to listen for notifications.
     @discussion A notification object may deliver notifications to a dispatch client.
@@ -391,7 +404,7 @@ IOServiceGetMatchingService(
     @discussion This is the preferred method of finding IOService objects currently registered by IOKit (that is, objects that have had their registerService() methods invoked). To find IOService objects that aren't yet registered, use an iterator as created by IORegistryEntryCreateIterator(). IOServiceAddMatchingNotification can also supply this information and install a notification of new IOServices. The matching information used in the matching dictionary may vary depending on the class of service being looked up.
     @param masterPort The master port obtained from IOMasterPort(). Pass kIOMasterPortDefault to look up the default master port.
     @param matching A CF dictionary containing matching information, of which one reference is always consumed by this function (Note prior to the Tiger release there was a small chance that the dictionary might not be released if there was an error attempting to serialize the dictionary). IOKitLib can construct matching dictionaries for common criteria with helper functions such as IOServiceMatching, IOServiceNameMatching, IOBSDNameMatching.
-    @param existing An iterator handle is returned on success, and should be released by the caller when the iteration is finished.
+    @param existing An iterator handle, or NULL, is returned on success, and should be released by the caller when the iteration is finished. If NULL is returned, the iteration was successful but found no matching services.
     @result A kern_return_t error code. */
 
 kern_return_t

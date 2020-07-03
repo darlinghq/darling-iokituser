@@ -10,4 +10,19 @@ CF_EXPORT
 const CFArrayCallBacks kIOHIDFilterPluginArrayCallBacks;
 
 CF_EXPORT
-void _IOHIDLoadBundles();
+CFArrayRef _IOHIDLoadBundles();
+
+CF_EXPORT
+CFArrayRef _IOHIDLoadSessionFilterBundles();
+
+CF_EXPORT
+CFArrayRef _IOHIDLoadServiceFilterBundles();
+
+CF_EXPORT
+CFArrayRef _IOHIDLoadServicePluginBundles();
+
+void _IOHIDPlugInInstanceCacheAdd (CFUUIDRef factory, const void *value);
+
+void _IOHIDPlugInInstanceCacheClear ();
+
+boolean_t _IOHIDPlugInInstanceCacheIsEmpty ();
