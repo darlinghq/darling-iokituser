@@ -1,1 +1,1 @@
-../../../graphics.subproj/IOGraphicsTypesPrivate.h
+../../../IOGraphics/IOGraphicsFamily/IOKit/graphics/IOGraphicsTypesPrivate.h

@@ -1,0 +1,6 @@
+[submodule "IOGraphics"]
+	path = IOGraphics
+	url = ../darling-IOGraphics.git
+[submodule "IOHIDFamily"]
+	path = IOHIDFamily
+	url = ../darling-IOHIDFamily.git

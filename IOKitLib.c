@@ -157,6 +157,11 @@ IOMasterPort( mach_port_t bootstrapPort __unused, mach_port_t * masterPort )
         return bootstrap_look_up(bootstrapPort, "com.apple.iokitsimd", masterPort);
     }
 #endif
+#ifdef DARLING
+    if (bootstrapPort == MACH_PORT_NULL)
+        bootstrapPort = bootstrap_port;
+    return bootstrap_look_up(bootstrapPort, "org.darlinghq.iokitd", masterPort);
+#endif
 
     host_port = mach_host_self();
     result = host_get_io_master(host_port, masterPort);

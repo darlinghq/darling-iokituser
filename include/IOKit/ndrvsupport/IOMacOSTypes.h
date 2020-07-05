@@ -112,7 +112,7 @@ typedef unsigned char Boolean;
 
 typedef short OSErr;
 
-//typedef unsigned int FourCharCode;
+typedef unsigned int FourCharCode;
 
 typedef FourCharCode OSType;
 
