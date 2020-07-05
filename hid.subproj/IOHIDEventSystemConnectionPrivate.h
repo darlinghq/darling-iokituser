@@ -18,6 +18,8 @@ typedef Boolean (*IOHIDEventSystemConnectionDemuxCallback)(IOHIDEventSystemConne
 
 typedef union IOHIDEventSystemConnectionEntitlements IOHIDEventSystemConnectionEntitlements;
 
+void _IOHIDEventSystemConnectionReleasePrivate(IOHIDEventSystemConnectionRef conn);
+
 CF_IMPLICIT_BRIDGING_DISABLED
 CF_ASSUME_NONNULL_END
 

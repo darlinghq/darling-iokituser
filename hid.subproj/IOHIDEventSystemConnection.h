@@ -14,6 +14,8 @@ CF_IMPLICIT_BRIDGING_ENABLED
 
 typedef struct CF_BRIDGED_TYPE(id) __IOHIDEventSystemConnection* IOHIDEventSystemConnectionRef;
 
+CFStringRef IOHIDEventSystemConnectionCopyDescription(IOHIDEventSystemConnectionRef conn);
+
 CF_IMPLICIT_BRIDGING_DISABLED
 CF_ASSUME_NONNULL_END
 

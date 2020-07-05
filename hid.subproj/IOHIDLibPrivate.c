@@ -20,6 +20,7 @@
  * 
  * @APPLE_LICENSE_HEADER_END@
  */
+// modified for Darling
 
 #include <IOKit/IOKitLib.h>
 #include <IOKit/IOReturn.h>
@@ -36,6 +37,9 @@
 #include "IOHIDEvent.h"
 #include <IOKit/hid/AppleHIDUsageTables.h>
 #include <os/assumes.h>
+
+// i couldn't find any other place that looks like it should contain this
+uint32_t gIOHIDDebugConfig = 0;
 
 void _IOObjectCFRelease(        CFAllocatorRef          allocator  __unused, 
                                 const void *            value)

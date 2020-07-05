@@ -142,8 +142,7 @@ set(iokit_sources
 	pwr_mgt.subproj/IOPMUPSPrefs.c
 	usb.subproj/IOUSBLib.c
 
-	${CMAKE_CURRENT_BINARY_DIR}/iokitmig32.c
-	${CMAKE_CURRENT_BINARY_DIR}/iokitmig64.c
+	iokitmig.c # it'll automatically include `${CMAKE_CURRENT_BINARY_DIR}/iokitmig32.c` or `${CMAKE_CURRENT_BINARY_DIR}/iokitmig64.c`, depending on what architecture we're building for
 	#${CMAKE_CURRENT_BINARY_DIR}/hid.subproj/IOHIDEventSystemClientMIGUser.c
 	#${CMAKE_CURRENT_BINARY_DIR}/hid.subproj/IOHIDEventSystemClientMIGServer.c
 	#${CMAKE_CURRENT_BINARY_DIR}/hid.subproj/IOHIDEventSystemMIGUser.c
@@ -165,4 +164,9 @@ add_framework(IOKit CURRENT_VERSION FAT
 		system
 		CoreFoundation
 		energytrace
+		cxx
+		objc
+		z
+		DiagnosticMessagesClient
+		libkxld
 )
