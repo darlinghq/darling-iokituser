@@ -58,6 +58,12 @@ unset(MIG_XTRACE_SUFFIX)
 mig(kext.subproj/kextmanager_mig.defs)
 mig(pwr_mgt.subproj/powermanagement.defs)
 
+add_custom_target(iokit_generate_mig
+	DEPENDS
+		${CMAKE_CURRENT_BINARY_DIR}/iokitmig32.c
+		${CMAKE_CURRENT_BINARY_DIR}/iokitmig64.c
+)
+
 set(iokit_sources
 	IOCFPlugIn.c
 	IOCFSerialize.c
@@ -169,4 +175,8 @@ add_framework(IOKit CURRENT_VERSION FAT
 		z
 		DiagnosticMessagesClient
 		libkxld
+)
+
+add_dependencies(IOKit
+	iokit_generate_mig
 )
