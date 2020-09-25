@@ -73,7 +73,7 @@ set(iokit_sources
 	IOKitLib.c
 	IOMIGMachPort.c
 	IOSystemConfiguration.c
-	IOTrap.S
+	#IOTrap.S # we don't need it and even if we did, our IOKit is in userspace, so we would have a define a custom `iokit_user_client_trap` function
 	graphics.subproj/IOAccelSurfaceControl.c
 	graphics.subproj/IODisplayLib.c
 	graphics.subproj/IOGraphicsLib.c

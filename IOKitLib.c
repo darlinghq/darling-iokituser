@@ -1993,6 +1993,8 @@ IOConnectCallAsyncScalarMethod(
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
+// we don't need these traps
+#ifndef DARLING
 kern_return_t
 IOConnectTrap0(io_connect_t	connect,
 	       uint32_t		index)
@@ -2062,6 +2064,7 @@ IOConnectTrap6(io_connect_t	connect,
 {
     return iokit_user_client_trap(connect, index, p1, p2, p3, p4, p5, p6);
 }
+#endif
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
