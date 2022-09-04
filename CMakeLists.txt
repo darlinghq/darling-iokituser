@@ -1,5 +1,7 @@
 project(IOKitUser)
 
+remove_sdk_framework(IOKit)
+
 add_compile_definitions(
 	# from Xcode build files
 	IOKIT
@@ -162,8 +164,16 @@ set_source_files_properties(kext.subproj/cross_link.c PROPERTIES
 )
 
 set(DYLIB_CURRENT_VERSION "275.0.0")
+
+set(FRAMEWORK_VERSION "A")
+
+generate_sdk_framework(IOKit
+    VERSION ${FRAMEWORK_VERSION}
+    HEADER "include/IOKit"
+)
+
 add_framework(IOKit CURRENT_VERSION FAT
-	VERSION "A"
+	VERSION ${FRAMEWORK_VERSION}
 	SOURCES
 		${iokit_sources}
 	DEPENDENCIES
