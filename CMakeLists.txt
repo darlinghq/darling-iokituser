@@ -31,6 +31,7 @@ include_directories(
 
 add_compile_options(
 	-fconstant-cfstrings
+	-Wno-error=int-conversion
 )
 
 set(MIG_ARCH "x86_64")
