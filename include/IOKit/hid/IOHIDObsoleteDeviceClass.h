@@ -1,1 +1,1 @@
-../../../IOHIDFamily/IOHIDLib/IOHIDObsoleteDeviceClass.h
+../../../darling/submodules/IOHIDFamily/IOHIDLib/IOHIDObsoleteDeviceClass.h

@@ -1,1 +1,1 @@
-../../../IOHIDFamily/IOHIDSystem/IOKit/hidsystem/IOHIDDescriptorParser.h
+../../../darling/submodules/IOHIDFamily/IOHIDSystem/IOKit/hidsystem/IOHIDDescriptorParser.h

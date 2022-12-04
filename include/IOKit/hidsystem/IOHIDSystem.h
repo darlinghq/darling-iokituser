@@ -1,1 +1,1 @@
-../../../IOHIDFamily/IOHIDSystem/IOKit/hidsystem/IOHIDSystem.h
+../../../darling/submodules/IOHIDFamily/IOHIDSystem/IOKit/hidsystem/IOHIDSystem.h

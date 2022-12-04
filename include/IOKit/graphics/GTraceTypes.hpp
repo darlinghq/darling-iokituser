@@ -1,1 +1,1 @@
-../../../IOGraphics/IOGraphicsFamily/IOKit/graphics/GTraceTypes.hpp
+../../../darling/submodules/IOGraphics/IOGraphicsFamily/IOKit/graphics/GTraceTypes.hpp

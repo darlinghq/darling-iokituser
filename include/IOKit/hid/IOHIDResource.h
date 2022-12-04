@@ -1,1 +1,1 @@
-../../../IOHIDFamily/IOHIDFamily/IOHIDResource.h
+../../../darling/submodules/IOHIDFamily/IOHIDFamily/IOHIDResource.h

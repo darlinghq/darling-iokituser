@@ -1,1 +1,1 @@
-../../../IOGraphics/IOGraphicsFamily/IOKit/graphics/IOGraphicsPrivate.h
+../../../darling/submodules/IOGraphics/IOGraphicsFamily/IOKit/graphics/IOGraphicsPrivate.h

@@ -1,1 +1,1 @@
-../../../IOGraphics/IOGraphicsFamily/IOKit/graphics/IOGraphicsDevice.h
+../../../darling/submodules/IOGraphics/IOGraphicsFamily/IOKit/graphics/IOGraphicsDevice.h

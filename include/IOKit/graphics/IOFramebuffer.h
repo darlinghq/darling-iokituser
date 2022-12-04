@@ -1,1 +1,1 @@
-../../../IOGraphics/IOGraphicsFamily/IOKit/graphics/IOFramebuffer.h
+../../../darling/submodules/IOGraphics/IOGraphicsFamily/IOKit/graphics/IOFramebuffer.h

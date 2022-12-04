@@ -1,1 +1,1 @@
-../../../IOHIDFamily/IOHIDFamily/IOHIDProviderPropertyMerger.h
+../../../darling/submodules/IOHIDFamily/IOHIDFamily/IOHIDProviderPropertyMerger.h

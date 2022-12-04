@@ -1,1 +1,1 @@
-../../../IOGraphics/IOGraphicsFamily/IOKit/graphics/IOBacklightDisplayTrace.h
+../../../darling/submodules/IOGraphics/IOGraphicsFamily/IOKit/graphics/IOBacklightDisplayTrace.h

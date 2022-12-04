@@ -1,1 +1,1 @@
-../../../IOGraphics/IOGraphicsFamily/IOKit/graphics/IOAccelTypes.h
+../../../darling/submodules/IOGraphics/IOGraphicsFamily/IOKit/graphics/IOAccelTypes.h

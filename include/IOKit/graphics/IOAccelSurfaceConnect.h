@@ -1,1 +1,1 @@
-../../../IOGraphics/IOGraphicsFamily/IOKit/graphics/IOAccelSurfaceConnect.h
+../../../darling/submodules/IOGraphics/IOGraphicsFamily/IOKit/graphics/IOAccelSurfaceConnect.h
