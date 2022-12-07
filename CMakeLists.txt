@@ -21,7 +21,7 @@ add_compile_definitions(
 
 include_directories(
 	${CMAKE_CURRENT_SOURCE_DIR}
-	${CMAKE_CURRENT_SOURCE_DIR}/include
+	${CMAKE_CURRENT_SOURCE_DIR}/darling/include
 	${CMAKE_CURRENT_SOURCE_DIR}/internal-include
 	${CMAKE_CURRENT_SOURCE_DIR}/hid.subproj
 	${CMAKE_CURRENT_BINARY_DIR}
@@ -176,7 +176,7 @@ set(FRAMEWORK_VERSION "A")
 
 generate_sdk_framework(IOKit
     VERSION ${FRAMEWORK_VERSION}
-    HEADER "include/IOKit"
+    HEADER "darling/include/IOKit"
 )
 
 add_framework(IOKit CURRENT_VERSION FAT

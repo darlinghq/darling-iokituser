@@ -1,1 +1,0 @@
-../../../darling/submodules/IOGraphics/IOGraphicsFamily/IOKit/graphics/IOGraphicsTypes.h
