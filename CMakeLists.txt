@@ -21,7 +21,7 @@ add_compile_definitions(
 
 include_directories(
 	${CMAKE_CURRENT_SOURCE_DIR}
-	${CMAKE_CURRENT_SOURCE_DIR}/include
+	${CMAKE_CURRENT_SOURCE_DIR}/darling/include
 	${CMAKE_CURRENT_SOURCE_DIR}/internal-include
 	${CMAKE_CURRENT_SOURCE_DIR}/hid.subproj
 	${CMAKE_CURRENT_BINARY_DIR}
@@ -106,6 +106,7 @@ set(iokit_sources
 	hid.subproj/IOHIDManager.c
 	hid.subproj/IOHIDNotification.c
 	hid.subproj/IOHIDPlugins.c
+	hid.subproj/IOHIDPreferences.c
 	hid.subproj/IOHIDQueue.c
 	hid.subproj/IOHIDService.c
 	hid.subproj/IOHIDServiceClient.c
@@ -127,6 +128,7 @@ set(iokit_sources
 	kext.subproj/cross_link.c
 	kext.subproj/fat_util.c
 	kext.subproj/FileAbstraction.hpp
+	kext.subproj/kernelmanagement_shims.c
 	kext.subproj/KextManager.c
 	kext.subproj/kextsplit.h
 	kext.subproj/macho_util.c
@@ -164,13 +166,17 @@ set_source_files_properties(kext.subproj/cross_link.c PROPERTIES
 	COMPILE_FLAGS " -DKERNEL"
 )
 
+set_source_files_properties(kext.subproj/kernelmanagement_shims.c PROPERTIES
+	COMPILE_FLAGS "-x objective-c"
+)
+
 set(DYLIB_CURRENT_VERSION "275.0.0")
 
 set(FRAMEWORK_VERSION "A")
 
 generate_sdk_framework(IOKit
     VERSION ${FRAMEWORK_VERSION}
-    HEADER "include/IOKit"
+    HEADER "darling/include/IOKit"
 )
 
 add_framework(IOKit CURRENT_VERSION FAT

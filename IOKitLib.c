@@ -51,6 +51,7 @@
 #include <CoreFoundation/CFMachPort.h>
 
 #include <libkern/OSAtomic.h>
+#include <libkern/OSKextLibPrivate.h>
 
 #include <IOKit/IOBSD.h>
 #include <IOKit/IOKitLib.h>
@@ -101,6 +102,7 @@ uint64_t
 gIOKitLibServerVersion;
 CFOptionFlags
 gIOKitLibSerializeOptions = kIOCFSerializeToBinary;
+
 
 /*
  * Ports
@@ -239,7 +241,8 @@ IOObjectGetClass(
 	io_object_t	object,
 	io_name_t       className )
 {
-    return _IOObjectGetClass(object, 0, className);
+    kern_return_t result = _IOObjectGetClass(object, 0, className);
+    return result;
 }
 
 kern_return_t
@@ -264,7 +267,8 @@ _IOObjectGetClass(
     }
 #endif /* !TARGET_OS_SIMULATOR */
 
-    return( override ? kIOReturnSuccess : io_object_get_class( object, className ));
+    kern_return_t result = ( override ? kIOReturnSuccess : io_object_get_class( object, className ));
+    return result;
 }
 
 
@@ -306,8 +310,9 @@ IOObjectCopySuperclassForClass(CFStringRef classname)
 	return my_str;
     }
 
-    my_cstr = malloc(sizeof(char) * 128);
-    CFStringGetCString (classname, my_cstr, 128, kCFStringEncodingUTF8);
+    my_cstr = malloc(sizeof(io_name_t));
+    bzero(my_cstr, sizeof(io_name_t));
+    CFStringGetCString (classname, my_cstr, sizeof(io_name_t), kCFStringEncodingUTF8);
 
     strncpy(orig_name, my_cstr, sizeof(io_name_t));
 
@@ -339,8 +344,8 @@ IOObjectCopyBundleIdentifierForClass(CFStringRef classname)
 	return my_str;
     }
 
-    my_cstr = malloc(sizeof(char) * 128);
-    CFStringGetCString (classname, my_cstr, 128, kCFStringEncodingUTF8);
+    my_cstr = malloc(sizeof(io_name_t));
+    CFStringGetCString (classname, my_cstr, sizeof(io_name_t), kCFStringEncodingUTF8);
 
     strncpy(orig_name, my_cstr, sizeof(io_name_t));
 
@@ -1871,6 +1876,7 @@ IOConnectCallAsyncMethod(
     mach_vm_size_t		 ool_input_size  = 0;
     mach_vm_address_t		 ool_output      = 0;
     mach_vm_size_t		 ool_output_size = 0;
+    static uint64_t		 temp_reference[1] = {0};
 
     if (inputStructCnt <= sizeof(io_struct_inband_t)) {
 	inb_input      = (void *) inputStruct;
@@ -1897,6 +1903,11 @@ IOConnectCallAsyncMethod(
 	    ool_output      = reinterpret_cast_mach_vm_address_t(outputStruct);
 	    ool_output_size = (mach_vm_size_t)    size;
 	}
+    }
+
+    if (reference == NULL && referenceCnt == 0) {
+        reference = temp_reference;
+        referenceCnt = 1;
     }
 
     rtn = io_connect_async_method(connection,         wakePort,
@@ -2064,7 +2075,7 @@ IOConnectTrap6(io_connect_t	connect,
 {
     return iokit_user_client_trap(connect, index, p1, p2, p3, p4, p5, p6);
 }
-#endif
+#endif // !DARLING
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
@@ -2288,7 +2299,8 @@ IORegistryEntryGetPath(
 	const io_name_t		plane,
 	io_string_t		path )
 {
-    return( io_registry_entry_get_path( entry, (char *) plane, path ));
+    kern_return_t kr = io_registry_entry_get_path( entry, (char *) plane, path );
+    return kr;
 }
 
 CFStringRef
@@ -2343,7 +2355,8 @@ IORegistryEntryGetName(
 	io_registry_entry_t	entry,
 	io_name_t 	        name )
 {
-    return( io_registry_entry_get_name( entry, name ));
+    kern_return_t result = ( io_registry_entry_get_name( entry, name ));
+    return result;
 }
 
 kern_return_t
@@ -2352,10 +2365,12 @@ IORegistryEntryGetNameInPlane(
 	const io_name_t 	plane,
 	io_name_t 	        name )
 {
+
     if( NULL == plane)
         plane = "";
-    return( io_registry_entry_get_name_in_plane( entry,
-						(char *) plane, name ));
+    kern_return_t result = ( io_registry_entry_get_name_in_plane( entry,
+                                                                 (char *) plane, name ));
+    return result;
 }
 
 kern_return_t
@@ -2364,10 +2379,12 @@ IORegistryEntryGetLocationInPlane(
 	const io_name_t 	plane,
 	io_name_t 	        location )
 {
+
     if( NULL == plane)
         plane = "";
-    return( io_registry_entry_get_location_in_plane( entry,
-						(char *) plane, location ));
+    kern_return_t result = ( io_registry_entry_get_location_in_plane( entry,
+                                                                     (char *) plane, location ));
+    return result;
 }
 
 kern_return_t
@@ -2755,7 +2772,6 @@ IOCatalogueTerminate(
 	masterPort = _masterPort;
 
     kr = io_catalog_terminate( masterPort, flag, description );
-
     if ((masterPort != MACH_PORT_NULL) && (masterPort != _masterPort))
 	mach_port_deallocate(mach_task_self(), masterPort);
 

@@ -556,6 +556,9 @@ const CFStringRef kOSKextDiagnosticExecutableArchNotFoundKey =
 const CFStringRef kOSKextDiagnosticSymlinkKey =
                   CFSTR("The booter does not recognize symbolic links; "
                   "confirm these files/directories aren't needed for startup");
+const CFStringRef kOSKextDiagnosticInvalidSymlinkKey =
+                  CFSTR("The kext contains a symlink which is either not readable "
+                  "or points outside of its bundle; please remove");
 
 const CFStringRef kOSKextDiagnosticDeprecatedPropertyKey =
                   CFSTR("Deprecated property (ignored)");
@@ -812,6 +815,9 @@ static Boolean __OSKextAddLinkDependencies(
     CFMutableArrayRef linkDependencies,
     Boolean           needAllFlag,
     Boolean           bleedthroughFlag);
+
+static CFMutableArrayRef __CFDictionaryCopyKeys(
+    CFDictionaryRef aDict);
 
 static Boolean __OSKextReadSymbolReferences(
     OSKextRef              aKext,
@@ -1182,6 +1188,7 @@ CFStringRef __OSKextCopyExecutableRelativePath(OSKextRef aKext);
 static bool __OSKextShouldLog(
     OSKextRef        aKext,
     OSKextLogSpec    msgLogSpec);
+
 
 Boolean _isArray(CFTypeRef);
 Boolean _isDictionary(CFTypeRef);
@@ -3211,6 +3218,7 @@ CFMutableArrayRef __OSKextCreateKextsFromURL(
         }
         goto finish;
     }
+
 
    /*****
     * If anURL is not a kext bundle, then scan it as a directory
@@ -8741,6 +8749,7 @@ Boolean __OSKextReadSymbolReferences(
     unsigned int               num_syms      = 0;
     unsigned int               syms_bytes    = 0;
     unsigned int               sym_index     = 0;
+    size_t                     nlist_size    = sizeof(struct nlist);  // assume 32-bit, update below if 64-bit.
 
     __OSKextGetFileSystemPath(aKext, /* otherURL */ NULL,
         /* resolveToBase */ false, kextPath);
@@ -8769,6 +8778,7 @@ Boolean __OSKextReadSymbolReferences(
 
     if (ISMACHO64(MAGIC32(mach_header))) {
         sixtyfourbit = true;
+        nlist_size = sizeof(struct nlist_64);
     }
     if (ISSWAPPEDMACHO(MAGIC32(mach_header))) {
         swap = 1;
@@ -8788,7 +8798,7 @@ Boolean __OSKextReadSymbolReferences(
 
     syms_address = (char *)mach_header + sym_offset;
     string_list = (char *)mach_header + str_offset;
-    syms_bytes = num_syms * sizeof(struct nlist);
+    syms_bytes = num_syms * nlist_size;
 
     if (syms_address + syms_bytes > (char *)file_end) {
         OSKextLog(aKext, kOSKextLogErrorLevel | kOSKextLogLinkFlag,
@@ -8838,6 +8848,68 @@ Boolean __OSKextReadSymbolReferences(
 finish:
 
     SAFE_RELEASE(executable);
+    return result;
+}
+
+static CFMutableArrayRef __CFDictionaryCopyKeys(
+    CFDictionaryRef aDict)
+{
+    CFMutableArrayRef   result      = NULL;
+    CFIndex             keyCount    = 0;
+    void                **keys      = NULL; // must free
+
+    result = CFArrayCreateMutable(CFGetAllocator(aDict), 0, &kCFTypeArrayCallBacks);
+    if (!result) {
+        OSKextLogMemError();
+        goto finish;
+    }
+
+    keyCount = CFDictionaryGetCount(aDict);
+    if (keyCount == 0) {
+        goto finish;
+    }
+
+    keys = malloc(sizeof(*keys) * keyCount);
+    if (!keys) {
+        OSKextLogMemError();
+        SAFE_RELEASE_NULL(result);
+        goto finish;
+    }
+    bzero(keys, sizeof(*keys) * keyCount);
+
+    CFDictionaryGetKeysAndValues(aDict, (const void **)keys, NULL);
+    CFArrayReplaceValues(result, CFRangeMake(0, 0), (const void **)keys, keyCount);
+
+finish:
+    SAFE_FREE(keys);
+
+    return result;
+}
+
+/*********************************************************************
+*********************************************************************/
+CFMutableArrayRef OSKextCopySymbolReferences(
+    OSKextRef aKext)
+{
+    CFMutableArrayRef      result          = NULL;
+    CFMutableDictionaryRef undefSymbols    = NULL;  // must release
+
+    undefSymbols = CFDictionaryCreateMutable(CFGetAllocator(aKext),
+         0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    if (!undefSymbols) {
+        OSKextLogMemError();
+        goto finish;
+    }
+
+    if (!__OSKextReadSymbolReferences(aKext, undefSymbols)) {
+        goto finish;
+    }
+
+    result = __CFDictionaryCopyKeys(undefSymbols);
+
+finish:
+    SAFE_RELEASE(undefSymbols);
+
     return result;
 }
 
@@ -8917,6 +8989,7 @@ Boolean __OSKextFindSymbols(
     unsigned int               num_syms      = 0;
     unsigned int               syms_bytes    = 0;
     unsigned int               sym_index     = 0;
+    size_t                     nlist_size    = sizeof(struct nlist);  // assume 32-bit, update below if 64-bit
     CFMutableArrayRef          libsArray     = NULL;  // release if created
     OSKextRef                  libKext       = NULL;  // do not release
     char                     * symbol_name   = NULL;  // do not free
@@ -8941,6 +9014,7 @@ Boolean __OSKextFindSymbols(
 
     if (ISMACHO64(MAGIC32(mach_header))) {
         sixtyfourbit = true;
+        nlist_size = sizeof(struct nlist_64);
     }
     if (ISSWAPPEDMACHO(MAGIC32(mach_header))) {
         swap = 1;
@@ -8960,7 +9034,7 @@ Boolean __OSKextFindSymbols(
 
     syms_address = (char *)mach_header + sym_offset;
     string_list = (char *)mach_header + str_offset;
-    syms_bytes = num_syms * sizeof(struct nlist);
+    syms_bytes = num_syms * nlist_size;
 
     if (syms_address + syms_bytes > (char *)file_end) {
         OSKextLog(aKext, kOSKextLogErrorLevel | kOSKextLogLinkFlag,
@@ -12407,6 +12481,7 @@ CFDictionaryRef OSKextCopyLoadedKextInfo(
     CFArrayRef kextIdentifiers,
     CFArrayRef infoKeys)
 {
+
     CFDictionaryRef        result        = NULL;
     OSReturn               op_result     = kOSReturnError;
     CFMutableDictionaryRef requestDict   = NULL;  // must release
@@ -13414,11 +13489,14 @@ static Boolean __OSKextBasicFilesystemAuthenticationRecursive(
     CFURLRef anURL,
     CFURLRef pluginsURL)
 {
-    Boolean      result   = true;  // until we hit a bad one
-    CFStringRef  filename = NULL;   // must release
-    CFURLRef     absURL   = NULL;   // must release
+    Boolean      result   = true;    // until we hit a bad one
+    CFStringRef  filename = NULL;    // must release
+    CFURLRef     absURL   = NULL;    // must release
+
     char         kextPath[PATH_MAX];
     char         urlPath[PATH_MAX];
+    char        *linkPath = NULL;    // must free
+
     struct stat  stat_buf;
     struct stat  lstat_buf;
     CFArrayRef   urlContents = NULL; // must release
@@ -13489,6 +13567,44 @@ static Boolean __OSKextBasicFilesystemAuthenticationRecursive(
     }
 
     if ((lstat_buf.st_mode & S_IFMT) == S_IFLNK) {
+        linkPath = realpath(urlPath, NULL);
+        if (!linkPath) {
+            const char *errorString = strerror(errno);
+            __OSKextAddDiagnostic(aKext, kOSKextDiagnosticsFlagAuthentication,
+                kOSKextDiagnosticInvalidSymlinkKey, anURL, /* note */ errorString);
+
+            OSKextLog(/* kext */ aKext,
+                kOSKextLogErrorLevel |
+                kOSKextLogFileAccessFlag,
+                "Can't determine real path for %s (%s)",
+                urlPath,
+                errorString);
+            result = false;
+            goto finish;
+        }
+
+       OSKextLog(/* kext */ aKext,
+            kOSKextLogStepLevel |
+            kOSKextLogFileAccessFlag,
+            "Realpath for %s is %s",
+            urlPath,
+            linkPath);
+
+        if (strncmp(kextPath, linkPath, strlen(kextPath)) != 0) {
+            __OSKextAddDiagnostic(aKext, kOSKextDiagnosticsFlagAuthentication,
+                kOSKextDiagnosticInvalidSymlinkKey, anURL,
+                /* note */ "Symlink points outside of bundle.");
+
+            OSKextLog(/* kext */ aKext,
+                kOSKextLogErrorLevel |
+                kOSKextLogFileAccessFlag,
+                "Kext contains symlink at %s which points outside of its bundle at %s; rejecting.",
+                urlPath,
+                kextPath);
+            result = false;
+            goto finish;
+        }
+
         __OSKextAddDiagnostic(aKext, kOSKextDiagnosticsFlagWarnings,
             kOSKextDiagnosticSymlinkKey, anURL, /* note */ NULL);
         /* We don't consider this a hard failure. */
@@ -13529,6 +13645,7 @@ finish:
     SAFE_RELEASE(filename);
     SAFE_RELEASE(absURL);
     SAFE_RELEASE(urlContents);
+    SAFE_FREE(linkPath);
     return result;
 }
 
@@ -20210,6 +20327,7 @@ static bool __OSKextShouldLog(
 
     return logSpecMatch(msgLogSpec, __sUserLogFilter);
 }
+
 
 /*********************************************************************
 *********************************************************************/
