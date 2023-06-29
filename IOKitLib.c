@@ -31,7 +31,7 @@
 #include <mach/mach.h>
 #include <mach/mach_port.h>
 
-#if TARGET_OS_SIMULATOR
+#if TARGET_OS_SIMULATOR || defined(DARLING)
 #include <servers/bootstrap.h>
 #endif
 
