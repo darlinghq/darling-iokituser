@@ -15,7 +15,8 @@ add_compile_definitions(
 	OS_CRASH_ENABLE_EXPERIMENTAL_LIBTRACE=1
 
 	# not in Xcode build files, but seems necessary to us
-	_DARWIN_NO_64_BIT_INODE=1
+	# _DARWIN_NO_64_BIT_INODE=1 is incompatible with ARM64 (only 64-bit inodes)
+	$<$<NOT:$<BOOL:${TARGET_ARM64}>>:_DARWIN_NO_64_BIT_INODE=1>
 	PRIVATE
 )
 
