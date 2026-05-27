@@ -6,6 +6,6 @@
 
 DARLING_STUB_HEADER;
 
-void _IOHIDSessionReleasePrivate(IOHIDServiceRef session) {
+void _IOHIDSessionReleasePrivate(IOHIDSessionRef session) {
 	DARLING_STUB_LOG;
 };
