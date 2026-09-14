@@ -59,6 +59,11 @@ CFIndex IOHIDEventGetIntegerValue(IOHIDEventRef event, IOHIDEventField field) {
 	return 0;
 };
 
+double IOHIDEventGetFloatValue(IOHIDEventRef event, IOHIDEventField field) {
+	DARLING_STUB_LOG;
+	return 0.0;
+};
+
 IOHIDEventType IOHIDEventGetType(IOHIDEventRef event) {
 	DARLING_STUB_LOG;
 	return kIOHIDEventTypeNULL;

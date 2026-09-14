@@ -2,6 +2,7 @@
 
 #include <IOKit/hid/IOHIDServiceClient.h>
 #include <IOKit/hid/IOHIDServiceClientPrivate.h>
+#include <IOKit/hid/IOHIDEvent.h>
 #include "stub-log.h"
 
 DARLING_STUB_HEADER;
@@ -17,6 +18,11 @@ CFStringRef IOHIDServiceClientCopyDescription(IOHIDServiceClientRef service) {
 };
 
 CFTypeRef IOHIDServiceClientCopyProperty(IOHIDServiceClientRef service, CFStringRef key) {
+	DARLING_STUB_LOG;
+	return NULL;
+};
+
+IOHIDEventRef IOHIDServiceClientCopyEvent(IOHIDServiceClientRef service, int64_t type, int32_t options, int64_t matching) {
 	DARLING_STUB_LOG;
 	return NULL;
 };

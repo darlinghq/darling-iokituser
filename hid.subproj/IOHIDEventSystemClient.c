@@ -63,6 +63,14 @@ IOHIDEventSystemClientRef IOHIDEventSystemClientCreateWithType(CFAllocatorRef al
 	return (IOHIDEventSystemClientRef)_CFRuntimeCreateInstance(allocator, IOHIDEventSystemClientGetTypeID(), size, NULL);
 };
 
+IOHIDEventSystemClientRef IOHIDEventSystemClientCreate(CFAllocatorRef allocator) {
+	return IOHIDEventSystemClientCreateWithType(allocator, 0, NULL);
+};
+
+void IOHIDEventSystemClientSetMatching(IOHIDEventSystemClientRef client, CFDictionaryRef matching) {
+	DARLING_STUB_LOG;
+};
+
 Boolean IOHIDEventSystemClientSetProperty(IOHIDEventSystemClientRef client, CFStringRef key, CFTypeRef property) {
 	DARLING_STUB_LOG;
 	return 0;
