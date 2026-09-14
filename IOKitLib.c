@@ -189,6 +189,12 @@ IOMasterPort( mach_port_t bootstrapPort __unused, mach_port_t * masterPort )
 }
 
 kern_return_t
+IOMainPort( mach_port_t bootstrapPort, mach_port_t * mainPort )
+{
+    return IOMasterPort(bootstrapPort, mainPort);
+}
+
+kern_return_t
 IOCreateReceivePort( uint32_t msgType, mach_port_t * recvPort )
 {
     kern_return_t res;
