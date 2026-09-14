@@ -101,6 +101,9 @@ typedef void
 
 extern
 const mach_port_t kIOMasterPortDefault;
+extern
+const mach_port_t kIOMainPortDefault;
+
 
 /*! @function IOMasterPort
     @abstract Returns the mach port used to initiate communication with IOKit.
