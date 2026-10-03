@@ -452,6 +452,9 @@ IOReturn IOHIDDeviceOpen(
                                 IOHIDDeviceRef                  device, 
                                 IOOptionBits                    options)
 {
+    if (!device || !device->deviceInterface)
+        return kIOReturnBadArgument;
+
     return (*device->deviceInterface)->open(device->deviceInterface, options);
 }
 
@@ -462,6 +465,9 @@ IOReturn IOHIDDeviceClose(
                                 IOHIDDeviceRef                  device, 
                                 IOOptionBits                    options)
 {
+    if (!device || !device->deviceInterface)
+        return kIOReturnBadArgument;
+
     if ( device->inputValueCallbackSet )
         CFSetRemoveAllValues(device->inputValueCallbackSet);
     if ( device->inputReportCallbackSet )
@@ -535,12 +541,17 @@ CFTypeRef IOHIDDeviceGetProperty(
                                 CFStringRef                     key)
 {
     CFTypeRef   property = NULL;
-    IOReturn    ret;
+    IOReturn    ret = kIOReturnError;
     
-    ret = (*device->deviceInterface)->getProperty(
-                                            device->deviceInterface,
-                                            key, 
-                                            &property);
+    if (!device)
+        return NULL;
+
+    if (device->deviceInterface) {
+        ret = (*device->deviceInterface)->getProperty(
+                                                device->deviceInterface,
+                                                key, 
+                                                &property);
+    }
     
     if ((ret != kIOReturnSuccess) || !property) {
         if (device->properties) {
@@ -562,6 +573,9 @@ Boolean IOHIDDeviceSetProperty(
                                 CFStringRef                     key,
                                 CFTypeRef                       property)
 {
+    if (!device)
+        return FALSE;
+
     if (!device->properties) {
         device->properties = CFDictionaryCreateMutable(CFGetAllocator(device),
                                                         0,
@@ -648,26 +662,32 @@ Boolean __IOHIDDeviceSetupAsyncSupport(IOHIDDeviceRef device)
     Boolean                     result          = false;
     CFRunLoopSourceContext1     sourceContext   = { 1, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
     
+    if (!device || !device->deviceInterface)
+        return false;
+
     // we've already been scheduled
-    os_assert(!device->runLoop && !device->dispatchQueue, "Device already scheduled");
+    if (device->runLoop || device->dispatchQueue)
+        return true;
     
     require_action(!device->asyncEventSource, exit, result = true);
     
     ret = (*device->deviceInterface)->getAsyncEventSource(device->deviceInterface, &asyncSource);
     
-    os_assert(ret == kIOReturnSuccess && asyncSource, "Failed to get async event source: 0x%x %p", ret, asyncSource);
+    if (ret != kIOReturnSuccess || !asyncSource)
+        return false;
+
     device->asyncEventSource = (CFRunLoopSourceRef)asyncSource;
     
     CFRunLoopSourceGetContext(device->asyncEventSource, (CFRunLoopSourceContext *)&sourceContext);
     device->sourceContext = sourceContext;
     
     device->queuePort = (CFMachPortRef)device->sourceContext.info;
-    os_assert(device->queuePort, "Failed to get queue port %p %p", device->queuePort, &device->sourceContext);
+    if (!device->queuePort)
+        return false;
     
     if (!device->notificationPort) {
         device->notificationPort = IONotificationPortCreate(kIOMasterPortDefault);
     }
-    os_assert(device->notificationPort, "Failed to create notification port %p", device->notificationPort);
     
     result = true;
     
@@ -683,20 +703,28 @@ void IOHIDDeviceScheduleWithRunLoop(
                                 CFRunLoopRef                    runLoop, 
                                 CFStringRef                     runLoopMode)
 {
+    if (!device)
+        return;
+
     if (device->runLoop) {
         IOHIDDeviceUnscheduleFromRunLoop(device, device->runLoop, device->runLoopMode);
     }
     
-    os_assert(__IOHIDDeviceSetupAsyncSupport(device));
+    if (!__IOHIDDeviceSetupAsyncSupport(device))
+        return;
     
     device->runLoop     = runLoop;
     device->runLoopMode = runLoopMode;
     
-    CFRunLoopAddSource(device->runLoop, device->asyncEventSource, device->runLoopMode);
+    if (device->asyncEventSource) {
+        CFRunLoopAddSource(device->runLoop, device->asyncEventSource, device->runLoopMode);
+    }
     
-    CFRunLoopSourceRef source = IONotificationPortGetRunLoopSource(device->notificationPort);
-    if (source) {
-        CFRunLoopAddSource(device->runLoop, source, device->runLoopMode);
+    if (device->notificationPort) {
+        CFRunLoopSourceRef source = IONotificationPortGetRunLoopSource(device->notificationPort);
+        if (source) {
+            CFRunLoopAddSource(device->runLoop, source, device->runLoopMode);
+        }
     }
     
     // Default queue has already been created, so go ahead and schedule it
@@ -1892,6 +1920,9 @@ IOReturn IOHIDDeviceSetReport(
                                 const uint8_t *                 report,
                                 CFIndex                         reportLength)
 {
+    if (!device || !device->deviceInterface)
+        return kIOReturnBadArgument;
+
     return (*device->deviceInterface)->setReport(
                                                 device->deviceInterface,
                                                 reportType,
@@ -1952,6 +1983,9 @@ IOReturn IOHIDDeviceGetReport(
                                 uint8_t *                       report,
                                 CFIndex *                       pReportLength)
 {
+    if (!device || !device->deviceInterface)
+        return kIOReturnBadArgument;
+
     return (*device->deviceInterface)->getReport(
                                                 device->deviceInterface,
                                                 reportType,
@@ -2138,7 +2172,7 @@ void __IOHIDDeviceLoadProperties(IOHIDDeviceRef device)
             // Are there any UUIDs for this device?
             CFArrayRef uuids = (CFArrayRef)IOHIDPreferencesCopyDomain(__IOHIDDeviceGetRootKey(device), kCFPreferencesCurrentApplication);
             if (uuids && (CFGetTypeID(uuids) == CFArrayGetTypeID()) && CFArrayGetCount(uuids)) {
-                // VTN3 ¥ TODO: Add optional matching based on location ID and anything else you can think of
+                // VTN3 ï¿½ TODO: Add optional matching based on location ID and anything else you can think of
                 uuidStr = (CFStringRef)CFArrayGetValueAtIndex(uuids, 0);
             }
         }

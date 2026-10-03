@@ -777,6 +777,9 @@ IOServiceAddMatchingNotification(
         void *			refcon,
 	io_iterator_t * 	notification )
 {
+    if (!notifyPort || !notification)
+        return kIOReturnBadArgument;
+
     io_user_reference_t	asyncRef[kIOMatchingCalloutCount];
 
     asyncRef[kIOMatchingCalloutFuncIndex]   = (io_user_reference_t) callback;
@@ -797,6 +800,9 @@ IOServiceAddInterestNotification(
         void *			refcon,
         io_object_t *		notification )
 {
+    if (!notifyPort || !notification)
+        return kIOReturnBadArgument;
+
     io_user_reference_t	asyncRef[kIOInterestCalloutCount];
     kern_return_t	kr;
 
@@ -844,6 +850,8 @@ static void
 IONotificationPortRelease(void *ctxt)
 {
 	IONotificationPortRef notify = ctxt;
+	if (!notify)
+		return;
 
 	if (OSAtomicDecrement32(&notify->refcount) < 0) {
 		/* Note: dispatch sources require resources they are monitoring to be
@@ -868,6 +876,9 @@ void
 IONotificationPortDestroy(
 	IONotificationPortRef	notify )
 {
+	if (!notify)
+		return;
+
 	if (notify->cfmachPort) {
 		CFMachPortInvalidate(notify->cfmachPort);
 		CFRelease(notify->cfmachPort);
@@ -889,6 +900,9 @@ CFRunLoopSourceRef
 IONotificationPortGetRunLoopSource(
 	IONotificationPortRef	notify )
 {
+	if (!notify)
+		return NULL;
+
     CFMachPortContext 	    context;
     Boolean		            cfReusedPort = false;
 
