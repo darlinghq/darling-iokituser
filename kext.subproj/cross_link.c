@@ -22,6 +22,12 @@
  */
 #include "cross_link.h"
 
+/* On ARM64, PAGE_SHIFT_CONST is declared as extern int in kernel headers.
+ * This file is compiled with -DKERNEL, so we need to provide the definition.
+ * Darling uses 4KB pages (PAGE_SHIFT = 12). */
+#if defined(__aarch64__) || defined(__arm64__)
+int PAGE_SHIFT_CONST = 12;
+#endif
 
 /*********************************************************************
 * Module Internal Variables
