@@ -1060,6 +1060,11 @@ CFSetRef IOHIDManagerCopyDevices(
         return NULL;
     
     os_unfair_lock_lock(&manager->deviceLock);
+    // QUIRK: no matching devices gives NULL, not an empty set. Not
+    // documented. Evidence: black-box observation on macOS 27.0.1 (tier 2):
+    // NULL without a matching set, with a dictionary that matches nothing,
+    // with an empty matching array, and after IOHIDManagerOpen.
+    // Test: iohid_manager_copy_devices.c.
     if (manager->devices && CFSetGetCount(manager->devices) > 0) {
         devices = CFSetCreateCopy(CFGetAllocator(manager), manager->devices);
     }
