@@ -60,7 +60,6 @@ CFIndex IOHIDEventGetIntegerValue(IOHIDEventRef event, IOHIDEventField field) {
 };
 
 double IOHIDEventGetFloatValue(IOHIDEventRef event, IOHIDEventField field) {
-	DARLING_STUB_LOG;
 	return 0.0;
 };
 

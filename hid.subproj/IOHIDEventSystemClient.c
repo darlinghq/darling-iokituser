@@ -68,7 +68,6 @@ IOHIDEventSystemClientRef IOHIDEventSystemClientCreate(CFAllocatorRef allocator)
 };
 
 void IOHIDEventSystemClientSetMatching(IOHIDEventSystemClientRef client, CFDictionaryRef matching) {
-	DARLING_STUB_LOG;
 };
 
 Boolean IOHIDEventSystemClientSetProperty(IOHIDEventSystemClientRef client, CFStringRef key, CFTypeRef property) {

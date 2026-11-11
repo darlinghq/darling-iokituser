@@ -23,7 +23,6 @@ CFTypeRef IOHIDServiceClientCopyProperty(IOHIDServiceClientRef service, CFString
 };
 
 IOHIDEventRef IOHIDServiceClientCopyEvent(IOHIDServiceClientRef service, int64_t type, int32_t options, int64_t matching) {
-	DARLING_STUB_LOG;
 	return NULL;
 };
 

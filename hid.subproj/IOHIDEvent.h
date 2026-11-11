@@ -35,6 +35,8 @@ CFArrayRef IOHIDEventGetChildren(IOHIDEventRef event);
 
 IOHIDEventType IOHIDEventGetType(IOHIDEventRef event);
 
+double IOHIDEventGetFloatValue(IOHIDEventRef event, IOHIDEventField field);
+
 CFIndex IOHIDEventGetIntegerValue(IOHIDEventRef event, IOHIDEventField field);
 
 IOHIDEventRef IOHIDEventCreateVendorDefinedEvent(CFAllocatorRef allocator, uint64_t timestamp, uint32_t page, uint32_t usage, uint32_t version, uint8_t* data, uint32_t length, IOOptionBits options);
