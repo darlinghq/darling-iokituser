@@ -848,6 +848,9 @@ IOReturn IOHIDManagerOpen(
 {
     IOReturn ret = kIOReturnSuccess;
     
+    if (!manager)
+        return kIOReturnBadArgument;
+
     require(!manager->isOpen, exit);
     
     manager->isOpen = true;
@@ -888,6 +891,9 @@ IOReturn IOHIDManagerClose(
 {
     IOReturn ret = kIOReturnError;
     
+    if (!manager)
+        return kIOReturnBadArgument;
+
     if (manager->runLoop) {
         IOHIDManagerUnscheduleFromRunLoop(manager, manager->runLoop, manager->runLoopMode);
     }
@@ -998,6 +1004,9 @@ void IOHIDManagerSetDeviceMatchingMultiple(
     CFIndex         i, count;
     CFTypeRef       value;
     
+    if (!manager)
+        return;
+
     os_assert(manager->dispatchStateMask == kIOHIDDispatchStateInactive, "Manager has already been activated/cancelled.");
     
     if ( manager->devices ) {
@@ -1047,13 +1056,20 @@ CFSetRef IOHIDManagerCopyDevices(
 {
     CFSetRef devices = NULL;
     
-    require(manager->devices, exit);
+    if (!manager)
+        return NULL;
     
     os_unfair_lock_lock(&manager->deviceLock);
-    devices = CFSetCreateCopy(CFGetAllocator(manager), manager->devices);
+    // QUIRK: no matching devices gives NULL, not an empty set. Not
+    // documented. Evidence: black-box observation on macOS 27.0.1 (tier 2):
+    // NULL without a matching set, with a dictionary that matches nothing,
+    // with an empty matching array, and after IOHIDManagerOpen.
+    // Test: iohid_manager_copy_devices.c.
+    if (manager->devices && CFSetGetCount(manager->devices) > 0) {
+        devices = CFSetCreateCopy(CFGetAllocator(manager), manager->devices);
+    }
     os_unfair_lock_unlock(&manager->deviceLock);
     
-exit:
     return devices;
 }
 

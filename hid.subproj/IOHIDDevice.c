@@ -452,6 +452,9 @@ IOReturn IOHIDDeviceOpen(
                                 IOHIDDeviceRef                  device, 
                                 IOOptionBits                    options)
 {
+    if (!device || !device->deviceInterface)
+        return kIOReturnBadArgument;
+
     return (*device->deviceInterface)->open(device->deviceInterface, options);
 }
 
@@ -462,6 +465,9 @@ IOReturn IOHIDDeviceClose(
                                 IOHIDDeviceRef                  device, 
                                 IOOptionBits                    options)
 {
+    if (!device || !device->deviceInterface)
+        return kIOReturnBadArgument;
+
     if ( device->inputValueCallbackSet )
         CFSetRemoveAllValues(device->inputValueCallbackSet);
     if ( device->inputReportCallbackSet )
@@ -535,12 +541,17 @@ CFTypeRef IOHIDDeviceGetProperty(
                                 CFStringRef                     key)
 {
     CFTypeRef   property = NULL;
-    IOReturn    ret;
+    IOReturn    ret = kIOReturnError;
     
-    ret = (*device->deviceInterface)->getProperty(
-                                            device->deviceInterface,
-                                            key, 
-                                            &property);
+    if (!device)
+        return NULL;
+
+    if (device->deviceInterface) {
+        ret = (*device->deviceInterface)->getProperty(
+                                                device->deviceInterface,
+                                                key, 
+                                                &property);
+    }
     
     if ((ret != kIOReturnSuccess) || !property) {
         if (device->properties) {
@@ -562,6 +573,9 @@ Boolean IOHIDDeviceSetProperty(
                                 CFStringRef                     key,
                                 CFTypeRef                       property)
 {
+    if (!device)
+        return FALSE;
+
     if (!device->properties) {
         device->properties = CFDictionaryCreateMutable(CFGetAllocator(device),
                                                         0,
@@ -683,6 +697,9 @@ void IOHIDDeviceScheduleWithRunLoop(
                                 CFRunLoopRef                    runLoop, 
                                 CFStringRef                     runLoopMode)
 {
+    if (!device)
+        return;
+
     if (device->runLoop) {
         IOHIDDeviceUnscheduleFromRunLoop(device, device->runLoop, device->runLoopMode);
     }
@@ -1892,6 +1909,9 @@ IOReturn IOHIDDeviceSetReport(
                                 const uint8_t *                 report,
                                 CFIndex                         reportLength)
 {
+    if (!device || !device->deviceInterface)
+        return kIOReturnBadArgument;
+
     return (*device->deviceInterface)->setReport(
                                                 device->deviceInterface,
                                                 reportType,
@@ -1952,6 +1972,9 @@ IOReturn IOHIDDeviceGetReport(
                                 uint8_t *                       report,
                                 CFIndex *                       pReportLength)
 {
+    if (!device || !device->deviceInterface)
+        return kIOReturnBadArgument;
+
     return (*device->deviceInterface)->getReport(
                                                 device->deviceInterface,
                                                 reportType,

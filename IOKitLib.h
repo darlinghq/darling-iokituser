@@ -101,6 +101,9 @@ typedef void
 
 extern
 const mach_port_t kIOMasterPortDefault;
+extern
+const mach_port_t kIOMainPortDefault;
+
 
 /*! @function IOMasterPort
     @abstract Returns the mach port used to initiate communication with IOKit.
@@ -112,6 +115,17 @@ const mach_port_t kIOMasterPortDefault;
 kern_return_t
 IOMasterPort( mach_port_t	bootstrapPort,
 	      mach_port_t *	masterPort );
+
+/*! @function IOMainPort
+    @abstract Returns the mach port used to initiate communication with IOKit.
+    @discussion Functions that don't specify an existing object require the IOKit main port to be passed. This function obtains that port.
+    @param bootstrapPort Pass MACH_PORT_NULL for the default.
+    @param mainPort The main port is returned.
+    @result A kern_return_t error code. */
+
+kern_return_t
+IOMainPort( mach_port_t		bootstrapPort,
+	    mach_port_t *	mainPort );
 
 
 /*! @function IONotificationPortCreate

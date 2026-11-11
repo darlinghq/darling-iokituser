@@ -110,6 +110,8 @@ gIOKitLibSerializeOptions = kIOCFSerializeToBinary;
 
 extern 	mach_port_t 	mach_task_self();
 const 	mach_port_t 	kIOMasterPortDefault = MACH_PORT_NULL;
+const 	mach_port_t 	kIOMainPortDefault = MACH_PORT_NULL;
+
 
 static mach_port_t
 __IOGetDefaultMasterPort()
@@ -184,6 +186,12 @@ IOMasterPort( mach_port_t bootstrapPort __unused, mach_port_t * masterPort )
     */
     if (host_port) mach_port_deallocate(mach_task_self(), host_port);
     return result;
+}
+
+kern_return_t
+IOMainPort( mach_port_t bootstrapPort, mach_port_t * mainPort )
+{
+    return IOMasterPort(bootstrapPort, mainPort);
 }
 
 kern_return_t
@@ -769,6 +777,9 @@ IOServiceAddMatchingNotification(
         void *			refcon,
 	io_iterator_t * 	notification )
 {
+    if (!notifyPort || !notification)
+        return kIOReturnBadArgument;
+
     io_user_reference_t	asyncRef[kIOMatchingCalloutCount];
 
     asyncRef[kIOMatchingCalloutFuncIndex]   = (io_user_reference_t) callback;
@@ -789,6 +800,9 @@ IOServiceAddInterestNotification(
         void *			refcon,
         io_object_t *		notification )
 {
+    if (!notifyPort || !notification)
+        return kIOReturnBadArgument;
+
     io_user_reference_t	asyncRef[kIOInterestCalloutCount];
     kern_return_t	kr;
 
@@ -836,6 +850,8 @@ static void
 IONotificationPortRelease(void *ctxt)
 {
 	IONotificationPortRef notify = ctxt;
+	if (!notify)
+		return;
 
 	if (OSAtomicDecrement32(&notify->refcount) < 0) {
 		/* Note: dispatch sources require resources they are monitoring to be
@@ -860,6 +876,9 @@ void
 IONotificationPortDestroy(
 	IONotificationPortRef	notify )
 {
+	if (!notify)
+		return;
+
 	if (notify->cfmachPort) {
 		CFMachPortInvalidate(notify->cfmachPort);
 		CFRelease(notify->cfmachPort);
@@ -881,6 +900,9 @@ CFRunLoopSourceRef
 IONotificationPortGetRunLoopSource(
 	IONotificationPortRef	notify )
 {
+	if (!notify)
+		return NULL;
+
     CFMachPortContext 	    context;
     Boolean		            cfReusedPort = false;
 
