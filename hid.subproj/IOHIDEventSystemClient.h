@@ -20,6 +20,10 @@ enum {
 
 IOHIDEventSystemClientRef IOHIDEventSystemClientCreateWithType(CFAllocatorRef allocator, IOHIDEventSystemClientType client_type, CFDictionaryRef attrs);
 
+IOHIDEventSystemClientRef IOHIDEventSystemClientCreate(CFAllocatorRef allocator);
+
+void IOHIDEventSystemClientSetMatching(IOHIDEventSystemClientRef client, CFDictionaryRef matching);
+
 IOHIDServiceClientRef IOHIDEventSystemClientCopyServiceForRegistryID(IOHIDEventSystemClientRef client, uint64_t id);
 
 #endif // _IOKIT_IOHIDEVENTSYSTEMCLIENT_H
