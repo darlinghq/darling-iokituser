@@ -213,3 +213,50 @@ add_framework(IOKit CURRENT_VERSION FAT
 add_dependencies(IOKit
 	iokit_generate_mig
 )
+# IOHIDLib: the user-space half of IOHIDDevice. IOHIDDeviceCreate() loads it
+# through the IOCFPlugInTypes property of an IOHIDDevice service and talks to
+# the service's user client with it.
+include(darling_bundle)
+
+set(IOHIDFAMILY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/darling/submodules/IOHIDFamily)
+set(IOHIDLIB_DIR ${IOHIDFAMILY_DIR}/IOHIDLib)
+
+set(iohidlib_objc_sources
+	${IOHIDLIB_DIR}/HIDLibElement.m
+	${IOHIDLIB_DIR}/IOHIDDeviceClass.m
+	${IOHIDLIB_DIR}/IOHIDIUnknown2.m
+	${IOHIDLIB_DIR}/IOHIDObsoleteDeviceClass.m
+	${IOHIDLIB_DIR}/IOHIDTransactionClass.m
+)
+set(iohidlib_objcxx_sources
+	${IOHIDLIB_DIR}/IOHIDQueueClass.mm
+	${CMAKE_CURRENT_SOURCE_DIR}/darling/IOHIDLib/IOHIDLibFactory.mm
+)
+
+set_source_files_properties(${iohidlib_objc_sources} PROPERTIES COMPILE_FLAGS "-fobjc-arc -x objective-c")
+set_source_files_properties(${iohidlib_objcxx_sources} PROPERTIES COMPILE_FLAGS "-fobjc-arc -x objective-c++")
+set_source_files_properties(${IOHIDLIB_DIR}/IOHIDIUnknown.cpp PROPERTIES COMPILE_FLAGS "-x c++")
+
+add_darling_bundle(IOHIDLib ""
+	${iohidlib_objc_sources}
+	${iohidlib_objcxx_sources}
+	${IOHIDLIB_DIR}/IOHIDIUnknown.cpp
+)
+make_fat(IOHIDLib)
+target_include_directories(IOHIDLib PRIVATE
+	${CMAKE_CURRENT_SOURCE_DIR}/darling/IOHIDLib
+	${IOHIDLIB_DIR}
+	${IOHIDFAMILY_DIR}/IOHIDFamily
+	${IOHIDFAMILY_DIR}/IOHIDSystem/IOKit/hidsystem
+)
+target_compile_options(IOHIDLib PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/darling/IOHIDLib/IOHIDLibCompat.h)
+target_link_libraries(IOHIDLib IOKit CoreFoundation Foundation objc system cxx)
+set_target_properties(IOHIDLib PROPERTIES
+	OUTPUT_NAME "IOHIDLib"
+	PREFIX ""
+	SUFFIX ""
+)
+
+set(IOHIDLIB_PLUGIN_DIR libexec/darling/System/Library/Extensions/IOHIDFamily.kext/Contents/PlugIns/IOHIDLib.plugin/Contents)
+install(TARGETS IOHIDLib DESTINATION ${IOHIDLIB_PLUGIN_DIR}/MacOS)
+install(FILES darling/IOHIDLib/Info.plist DESTINATION ${IOHIDLIB_PLUGIN_DIR})
