@@ -1,0 +1,33 @@
+/*
+ * Copyright (C) 2026 Lubos Dolezel
+ *
+ * Requests of the IOKit client library to the IOKit service that have no
+ * counterpart in the XNU device interface (device.defs).
+ *
+ * A user client's shared memory (what IOConnectMapMemory maps) is an address
+ * range the kernel maps into the client's task. The IOKit service runs in a
+ * process of its own and cannot map anything into another process, so it
+ * hands the client the memory as a Mach port that carries a file descriptor
+ * (fileport) and the client maps that. Both sides must use this file.
+ */
+subsystem iokitdarling 3100;
+
+#include <mach/std_types.defs>
+#include <mach/mach_types.defs>
+
+serverprefix isd_;
+
+type io_connect_t = mach_port_t
+		ctype: mach_port_t;
+
+/*
+ * The memory the connection offers under memory_type: a send right to a
+ * fileport of the shared memory file, and its size in bytes. The memory has
+ * to be mapped with MAP_SHARED, read and write.
+ */
+routine io_connect_client_memory(
+	    connection		: io_connect_t;
+	in  memory_type		: uint32_t;
+	out memory		: mach_port_move_send_t;
+	out size		: uint64_t
+	);

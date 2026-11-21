@@ -92,6 +92,17 @@ typedef struct OSNotificationHeader NotificationHeader;
 
 #endif
 
+// Requests that have no XNU counterpart (iokitdarling.defs)
+#include <pthread.h>
+#include <sys/fileport.h>
+#if __LP64__
+#   define mig_external __private_extern__
+#   include <iokitdarling64.h>
+#   undef mig_external
+#else
+#   include <iokitdarling32.h>
+#endif
+
 #if IOKIT_SERVER_VERSION >= 20190926 && !TARGET_OS_SIMULATOR
 #define IOKIT_HAS_GET_PROPERTY_WITH_BUF 1
 #else
@@ -1697,6 +1708,112 @@ IOConnectSetNotificationPort(
 		type, port, reference));
 }
 
+/*
+ * Shared memory of a user client. The service lives in a process of its own
+ * and cannot map memory into ours, so it offers the memory as a fileport (see
+ * iokitdarling.defs) and it is mapped here. The mappings are remembered, as
+ * unmapping needs their size.
+ */
+struct IOConnectMapping {
+    mach_vm_address_t address;
+    mach_vm_size_t    size;
+    uint32_t          memoryType;
+    mach_port_t       connection;
+};
+
+static pthread_mutex_t     gIOConnectMappingsLock = PTHREAD_MUTEX_INITIALIZER;
+static struct IOConnectMapping *gIOConnectMappings;
+static size_t              gIOConnectMappingCount;
+
+static kern_return_t
+IOConnectMapMemoryInternal(
+	io_connect_t		connect,
+	uint32_t		memoryType,
+	task_port_t		intoTask,
+	mach_vm_address_t	*atAddress,
+	mach_vm_size_t		*ofSize,
+	IOOptionBits		options )
+{
+    mach_port_t		memory = MACH_PORT_NULL;
+    uint64_t		size = 0;
+    kern_return_t	kr;
+    int			fd;
+    void *		address;
+    int			flags = MAP_SHARED;
+    struct IOConnectMapping * grown;
+
+    // Only the calling task can be mapped into
+    if (intoTask != mach_task_self() && intoTask != MACH_PORT_NULL)
+	return kIOReturnBadArgument;
+
+    kr = io_connect_client_memory(connect, memoryType, &memory, &size);
+    if (kr != KERN_SUCCESS)
+	return kr;
+    if (memory == MACH_PORT_NULL)
+	return kIOReturnUnsupported;
+
+    fd = fileport_makefd(memory);
+    mach_port_deallocate(mach_task_self(), memory);
+    if (fd < 0)
+	return kIOReturnNoResources;
+
+    if (!(options & kIOMapAnywhere))
+	flags |= MAP_FIXED;
+    address = mmap((options & kIOMapAnywhere) ? NULL : (void *) (uintptr_t) *atAddress,
+		   (size_t) size, PROT_READ | PROT_WRITE, flags, fd, 0);
+    close(fd);
+    if (address == MAP_FAILED)
+	return kIOReturnNoMemory;
+
+    pthread_mutex_lock(&gIOConnectMappingsLock);
+    grown = realloc(gIOConnectMappings, (gIOConnectMappingCount + 1) * sizeof(*grown));
+    if (!grown) {
+	pthread_mutex_unlock(&gIOConnectMappingsLock);
+	munmap(address, (size_t) size);
+	return kIOReturnNoMemory;
+    }
+    gIOConnectMappings = grown;
+    gIOConnectMappings[gIOConnectMappingCount++] = (struct IOConnectMapping) {
+	.address = (mach_vm_address_t) (uintptr_t) address,
+	.size = size,
+	.memoryType = memoryType,
+	.connection = connect,
+    };
+    pthread_mutex_unlock(&gIOConnectMappingsLock);
+
+    *atAddress = (mach_vm_address_t) (uintptr_t) address;
+    *ofSize = size;
+    return kIOReturnSuccess;
+}
+
+static kern_return_t
+IOConnectUnmapMemoryInternal(
+	io_connect_t		connect,
+	uint32_t		memoryType,
+	task_port_t		fromTask,
+	mach_vm_address_t	atAddress )
+{
+    kern_return_t kr = kIOReturnNotFound;
+    size_t i;
+
+    if (fromTask != mach_task_self() && fromTask != MACH_PORT_NULL)
+	return kIOReturnBadArgument;
+
+    pthread_mutex_lock(&gIOConnectMappingsLock);
+    for (i = 0; i < gIOConnectMappingCount; i++) {
+	struct IOConnectMapping * m = &gIOConnectMappings[i];
+
+	if (m->address != atAddress || m->connection != connect || m->memoryType != memoryType)
+	    continue;
+	kr = munmap((void *) (uintptr_t) m->address, (size_t) m->size) == 0
+	   ? kIOReturnSuccess : kIOReturnError;
+	*m = gIOConnectMappings[--gIOConnectMappingCount];
+	break;
+    }
+    pthread_mutex_unlock(&gIOConnectMappingsLock);
+    return kr;
+}
+
 kern_return_t IOConnectMapMemory(
 	 io_connect_t	connect,
 	 uint32_t		memoryType,
@@ -1705,14 +1822,16 @@ kern_return_t IOConnectMapMemory(
 	 vm_size_t		*ofSize,
 	 IOOptionBits	options )
 {
-#if __LP64__
-    return io_connect_map_memory_into_task
-		(connect, memoryType, intoTask, (mach_vm_address_t *) atAddress, (mach_vm_size_t *) ofSize, options);
+    mach_vm_address_t address = *atAddress;
+    mach_vm_size_t size = *ofSize;
+    kern_return_t kr;
 
-#else
-    return io_connect_map_memory
-		(connect, memoryType, intoTask, atAddress, ofSize, options);
-#endif
+    kr = IOConnectMapMemoryInternal(connect, memoryType, intoTask, &address, &size, options);
+    if (kr == KERN_SUCCESS) {
+	*atAddress = (vm_address_t) address;
+	*ofSize = (vm_size_t) size;
+    }
+    return kr;
 }
 
 kern_return_t IOConnectMapMemory64(
@@ -1723,8 +1842,7 @@ kern_return_t IOConnectMapMemory64(
 	 mach_vm_size_t		*ofSize,
 	 IOOptionBits		options )
 {
-    return io_connect_map_memory_into_task
-		(connect, memoryType, intoTask, atAddress, ofSize, options);
+    return IOConnectMapMemoryInternal(connect, memoryType, intoTask, atAddress, ofSize, options);
 }
 
 kern_return_t
@@ -1734,13 +1852,7 @@ IOConnectUnmapMemory(
 	task_port_t		fromTask,
 	vm_address_t		atAddress )
 {
-#if __LP64__
-    return io_connect_unmap_memory_from_task
-		(connect, memoryType, fromTask, atAddress);
-#else
-    return io_connect_unmap_memory
-		(connect, memoryType, fromTask, atAddress);
-#endif
+    return IOConnectUnmapMemoryInternal(connect, memoryType, fromTask, atAddress);
 }
 
 kern_return_t IOConnectUnmapMemory64(
@@ -1749,8 +1861,7 @@ kern_return_t IOConnectUnmapMemory64(
 	 task_port_t		fromTask,
 	 mach_vm_address_t	atAddress)
 {
-    return io_connect_unmap_memory_from_task
-		(connect, memoryType, fromTask, atAddress);
+    return IOConnectUnmapMemoryInternal(connect, memoryType, fromTask, atAddress);
 }
 
 kern_return_t
