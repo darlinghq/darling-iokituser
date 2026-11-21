@@ -18,13 +18,12 @@ add_compile_definitions(
 	PRIVATE
 )
 
-# _DARWIN_NO_64_BIT_INODE=1 is incompatible with ARM64 (only 64-bit inodes).
-# Use a plain if() rather than a generator expression: mig() reads the raw
-# COMPILE_DEFINITIONS and prefixes each entry with -D, so a genex that evaluates
-# to nothing leaves a bare "-D" that swallows the next flag ("-D -DPRIVATE").
-if (NOT TARGET_ARM64)
-	add_compile_definitions(_DARWIN_NO_64_BIT_INODE=1)
-endif()
+# The Intel slices use the 32-bit inode ABI here (arm64 only has 64-bit inodes). This is a
+# per-slice compile option rather than a directory definition, so mig() does not see it; the
+# .defs only use the Mach types, and the headers they import are compiled with these options.
+darling_archs(iokit_intel_archs FAMILY x86)
+darling_xarch_options(iokit_inode_options ARCHS ${iokit_intel_archs} OPTIONS -D_DARWIN_NO_64_BIT_INODE=1)
+add_compile_options(${iokit_inode_options})
 
 include_directories(
 	${CMAKE_CURRENT_SOURCE_DIR}
