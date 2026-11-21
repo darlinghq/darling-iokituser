@@ -48,6 +48,9 @@ set(MIG_SERVER_SOURCE_SUFFIX "Server64.c")
 set(MIG_SERVER_HEADER_SUFFIX "Server64.h")
 set(MIG_XTRACE_SUFFIX "XtraceMig64.c")
 mig(iokitmig.defs)
+set(MIG_NO_XTRACE 1)
+mig(iokitdarling.defs)
+unset(MIG_NO_XTRACE)
 
 set(MIG_ARCH "i386")
 set(MIG_USER_SOURCE_SUFFIX "32.c")
@@ -56,6 +59,9 @@ set(MIG_SERVER_SOURCE_SUFFIX "Server32.c")
 set(MIG_SERVER_HEADER_SUFFIX "Server32.h")
 set(MIG_XTRACE_SUFFIX "XtraceMig32.c")
 mig(iokitmig.defs)
+set(MIG_NO_XTRACE 1)
+mig(iokitdarling.defs)
+unset(MIG_NO_XTRACE)
 
 unset(MIG_ARCH)
 unset(MIG_USER_SOURCE_SUFFIX)
@@ -72,6 +78,8 @@ add_custom_target(iokit_generate_mig
 	DEPENDS
 		${CMAKE_CURRENT_BINARY_DIR}/iokitmig32.c
 		${CMAKE_CURRENT_BINARY_DIR}/iokitmig64.c
+		${CMAKE_CURRENT_BINARY_DIR}/iokitdarling32.c
+		${CMAKE_CURRENT_BINARY_DIR}/iokitdarling64.c
 )
 
 set(iokit_sources
@@ -81,6 +89,7 @@ set(iokit_sources
 	IOCFURLAccess.c
 	IODataQueueClient.c
 	IOKitLib.c
+	iokitdarling.c
 	IOMIGMachPort.c
 	IOSystemConfiguration.c
 	#IOTrap.S # we don't need it and even if we did, our IOKit is in userspace, so we would have a define a custom `iokit_user_client_trap` function
