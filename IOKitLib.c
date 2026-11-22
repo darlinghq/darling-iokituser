@@ -63,6 +63,10 @@
 #include <IOKit/IOKitLibPrivate.h>
 #include <IOKit/IOKitKeysPrivate.h>
 
+// Bit of word 0 of an async reference that tells the server the client is a
+// 64-bit process (its completion messages then use 64-bit words).
+#define kIOUCAsync64Flag 1ULL
+
 #if __LP64__
 typedef struct OSNotificationHeader64 NotificationHeader;
 
@@ -2041,6 +2045,18 @@ IOConnectCallAsyncMethod(
     if (reference == NULL && referenceCnt == 0) {
         reference = temp_reference;
         referenceCnt = 1;
+    }
+
+    // The completion of the call is a message to wakePort whose layout depends
+    // on the width of this process: word 0 of the async reference carries the
+    // 64-bit marker, as the XNU server stamps it into the reference of a
+    // 64-bit task, and the server of Darling cannot see the client's width
+    // itself. The caller's array stays untouched.
+    uint64_t marked_reference[kOSAsyncRef64Count];
+    if (reference != NULL && referenceCnt >= 1 && referenceCnt <= kOSAsyncRef64Count) {
+	memcpy(marked_reference, reference, referenceCnt * sizeof(reference[0]));
+	marked_reference[kIOAsyncReservedIndex] = (sizeof(void *) == 8) ? kIOUCAsync64Flag : 0;
+	reference = marked_reference;
     }
 
     rtn = io_connect_async_method(connection,         wakePort,
