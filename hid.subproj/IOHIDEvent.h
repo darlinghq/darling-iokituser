@@ -46,6 +46,16 @@ void IOHIDEventAppendEvent(IOHIDEventRef target_event, IOHIDEventRef event_to_ap
 
 void IOHIDEventGetVendorDefinedData(IOHIDEventRef event, uint8_t** data, CFIndex* data_length);
 
+typedef uint64_t IOHIDEventSenderID;
+typedef uint8_t IOHIDEventScrollMomentumBits;
+
+// The event's time, in mach_absolute_time() units.
+uint64_t IOHIDEventGetTimeStamp(IOHIDEventRef event);
+// The registry ID of the service the event came from.
+IOHIDEventSenderID IOHIDEventGetSenderID(IOHIDEventRef event);
+// The momentum phase bits of a scroll event.
+IOHIDEventScrollMomentumBits IOHIDEventGetScrollMomentum(IOHIDEventRef event);
+
 CF_IMPLICIT_BRIDGING_DISABLED
 CF_ASSUME_NONNULL_END
 
