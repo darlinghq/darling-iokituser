@@ -75,3 +75,17 @@ void IOHIDEventGetVendorDefinedData(IOHIDEventRef event, uint8_t** data, CFIndex
 	if (data_length)
 		*data_length = 0;
 };
+
+// No event can be created yet (the functions that create one return NULL), so these accessors are
+// never given an event and report nothing.
+uint64_t IOHIDEventGetTimeStamp(IOHIDEventRef event) {
+	return 0;
+};
+
+IOHIDEventSenderID IOHIDEventGetSenderID(IOHIDEventRef event) {
+	return 0;
+};
+
+IOHIDEventScrollMomentumBits IOHIDEventGetScrollMomentum(IOHIDEventRef event) {
+	return 0;
+};

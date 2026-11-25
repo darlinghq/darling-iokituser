@@ -74,3 +74,14 @@ Boolean IOHIDEventSystemClientSetProperty(IOHIDEventSystemClientRef client, CFSt
 	DARLING_STUB_LOG;
 	return 0;
 };
+
+// There is no event system to deliver events or service changes, so the client never calls back;
+// the queue is not used.
+void IOHIDEventSystemClientSetDispatchQueue(IOHIDEventSystemClientRef client, dispatch_queue_t queue) {
+};
+
+void IOHIDEventSystemClientActivate(IOHIDEventSystemClientRef client) {
+};
+
+void IOHIDEventSystemClientCancel(IOHIDEventSystemClientRef client) {
+};
